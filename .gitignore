@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# uv
+uv.lock
+
+# experiment artefacts (regenerated)
+experiments/**/results.jsonl
+experiments/**/*.png
+experiments/**/*.html
+wandb/
+outputs/
+
+# model weights / caches — never commit
+*.gguf
+*.safetensors
+models/
+.cache/
+
+# os
+.DS_Store

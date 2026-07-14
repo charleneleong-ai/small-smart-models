@@ -1,0 +1,35 @@
+# Codebook vs. imatrix on a 3B-active MoE — run config
+base_model: Qwen/Qwen3.6-35B-A3B
+
+# footprint budget everything is matched to (Unsloth UD-IQ2_M)
+target:
+  bytes: 11522702304   # 11.5 GB
+  rel_tol: 0.03
+
+baselines:
+  fp16: Qwen/Qwen3.6-35B-A3B
+  awq4: cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+  imatrix_gguf:
+    repo: unsloth/Qwen3.6-35B-A3B-GGUF
+    files: [UD-IQ2_M.gguf, UD-IQ2_XXS.gguf, UD-IQ1_M.gguf]
+
+method:
+  name: vptq            # vptq | aqlm
+  allocations: [uniform, expert_importance]
+  keep_high_precision: [router, attention, shared_expert, embed_tokens, lm_head]
+  high_precision_bits: 4
+
+profiling:
+  calib_dataset: allenai/c4
+  calib_rows: 512
+  seq_len: 2048
+
+eval:
+  perplexity_datasets: [wikitext-2-raw-v1, c4-slice]
+  tasks: [gsm8k, mmlu_pro, gpqa_diamond]
+  seq_len: 4096
+  stride: 2048
+
+tracking:
+  wandb_project: small-smart-models
+  wandb_group: bits-per-brain
