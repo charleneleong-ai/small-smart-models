@@ -3,7 +3,7 @@ name = "smart-quant"
 version = "0.1.0"
 description = "Benchmarking extreme low-bit quantization on intelligence-dense open MoEs"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "torch>=2.4",
     "transformers>=4.55",

@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # The suite covers smart_quant.footprint (dependency-free), so CI installs
+      # only pytest and stays fast. Heavier model/GPU checks run on the A100 box.
+      - run: pip install pytest
+      - run: pytest -q
