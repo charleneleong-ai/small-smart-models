@@ -101,9 +101,11 @@ The project succeeds on a *clear answer*, not on VPTQ winning:
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)
-2. **Profile** — expert-usage histogram over calibration set. Router layers identified by
-   `out_features == num_experts` (256), robust to the multimodal nesting — see
-   [`smart_quant.expert_importance`](../../src/smart_quant/expert_importance.py).
+2. **Profile** — expert-usage histogram over calibration set. Routers identified by the MoE
+   block's `gate` submodule (name-matched, so it survives both the transformers <=4
+   `nn.Linear` router and the >=5 `Qwen3MoeTopKRouter` refactor, plus the multimodal
+   nesting) — see [`smart_quant.expert_importance`](../../src/smart_quant/expert_importance.py).
+   Verified on the A100 against a real transformers-5 Qwen3-MoE module tree.
 3. **Encode** — VPTQ uniform, then expert-aware, at the IQ2_M budget.
 4. **Measure** — same harness; footprint-matched comparison table + quality-vs-bpw plot.
 5. **Write up** — `docs/experiments/vptq-vs-imatrix.md`, W&B run group `ssm-vptq`.
