@@ -99,3 +99,17 @@ class TestBitAllocation:
         bits = bits_from_frequency(freq, avg_bits=2.25, lo=1.5, hi=3.0)
         weighted_mean = (bits * freq).sum() / freq.sum()
         assert weighted_mean.item() == pytest.approx(2.25, abs=1e-4)
+
+    def test_weighted_mean_holds_under_skew(self):
+        # The case the old rescale-then-clamp got wrong: heavy skew forces clamping, yet
+        # the usage-weighted mean must still land exactly on target.
+        torch.manual_seed(1)
+        freq = torch.rand(NUM_EXPERTS) ** 3
+        freq = freq / freq.sum()
+        bits = bits_from_frequency(freq, avg_bits=2.5, lo=1.5, hi=3.0)
+        assert bits.min() >= 1.5 and bits.max() <= 3.0
+        assert ((bits * freq).sum()).item() == pytest.approx(2.5, abs=1e-4)
+
+    def test_infeasible_target_clamped_to_bound(self):
+        freq = torch.full((NUM_EXPERTS,), 1.0 / NUM_EXPERTS)
+        assert bits_from_frequency(freq, avg_bits=5.0).min().item() == pytest.approx(3.0)

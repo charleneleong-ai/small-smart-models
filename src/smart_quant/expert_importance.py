@@ -64,9 +64,20 @@ def bits_from_frequency(
     lo: float = 1.5,
     hi: float = 3.0,
 ) -> torch.Tensor:
-    """Map per-expert usage frequency to a per-expert bit budget in [lo, hi], rescaled so
-    the usage-weighted mean equals `avg_bits` (keeps the footprint on target)."""
-    rank = freq.argsort().argsort().float() / max(len(freq) - 1, 1)
-    bits = lo + rank * (hi - lo)
-    weighted_mean = (bits * freq).sum() / freq.sum().clamp(min=1e-9)
-    return (bits * (avg_bits / weighted_mean)).clamp(lo, hi)
+    """Per-expert bit budget in [lo, hi], increasing with usage, whose usage-weighted mean
+    is exactly `avg_bits` — so the footprint lands on target. Water-fills the hottest
+    experts up to `hi` first; `avg_bits` is clamped into [lo, hi] if the mean is infeasible."""
+    freq = freq / freq.sum().clamp(min=1e-9)
+    bits = torch.full_like(freq, float(lo))
+    surplus = min(max(avg_bits, lo), hi) - lo  # usage-weighted bits left to distribute
+    for i in torch.argsort(freq, descending=True):
+        if surplus <= 1e-12:
+            break
+        cap = (hi - lo) * freq[i].item()  # weighted cost to max out expert i
+        if surplus >= cap:
+            bits[i] = hi
+            surplus -= cap
+        else:
+            bits[i] = lo + surplus / freq[i].clamp(min=1e-9)
+            surplus = 0.0
+    return bits
