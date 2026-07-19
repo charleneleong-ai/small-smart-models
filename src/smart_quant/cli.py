@@ -38,7 +38,8 @@ def eval_model(
     model: str = typer.Option(..., help="HF repo id or local path."),
     label: str = typer.Option(..., help="Row label, e.g. fp16 / iq2_m / vptq-2bit."),
     gguf_file: str = typer.Option(None, help="GGUF filename within the repo (dequantized load)."),
-    dataset: str = typer.Option("wikitext-2-raw-v1"),
+    dataset: str = typer.Option("Salesforce/wikitext", help="HF dataset repo id."),
+    config: str = typer.Option("wikitext-2-raw-v1", help="Dataset config."),
     max_length: int = typer.Option(4096),
     stride: int = typer.Option(2048),
     out: Path = typer.Option(Path("experiments/bits-per-brain/results.jsonl")),
@@ -51,16 +52,17 @@ def eval_model(
 
     from smart_quant.eval import load_causal_lm, sliding_window_perplexity
 
+    # dataset first, so a bad id fails fast rather than after the multi-minute model load
     tok = AutoTokenizer.from_pretrained(model)
+    text = "\n\n".join(load_dataset(dataset, config, split="test")["text"])
     load_kwargs = {"dtype": "auto", "device_map": "cuda"}
     if gguf_file:
         load_kwargs["gguf_file"] = gguf_file
     lm = load_causal_lm(model, **load_kwargs).eval()
-    text = "\n\n".join(load_dataset("wikitext", dataset, split="test")["text"])
     ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
 
     row = {"label": label, "model": model, "gguf_file": gguf_file,
-           "wikitext_ppl": round(ppl, 4), "dataset": dataset}
+           "wikitext_ppl": round(ppl, 4), "dataset": f"{dataset}:{config}"}
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("a") as f:
         f.write(json.dumps(row) + "\n")
