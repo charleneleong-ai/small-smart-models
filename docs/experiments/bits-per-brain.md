@@ -102,14 +102,18 @@ The project succeeds on a *clear answer*, not on VPTQ winning:
 
 ### Phase 1 — baselines (wikitext-2 perplexity, transformers sliding-window 4096/2048, A100)
 
-| build | wikitext-2 ppl | footprint |
+| build | wikitext-2 ppl | harness / status |
 |---|---|---|
-| fp16 | **5.92** | ~70 GB |
-| UD-IQ2_M (~2.6 bpw) | _pending_ | 11.5 GB |
+| fp16 | **5.92** | transformers ✅ |
+| AWQ-4bit (cyankiwi) | — | blocked: gptqmodel Marlin kernel rejects `out_features=32` |
+| UD-IQ2_M / Q2_K (~2.6 bpw) | — | GGUF arch `qwen35moe` unmapped by transformers → llama.cpp only |
 
-fp16 is the quality ceiling; UD-IQ2_M is the exact bar the VPTQ encode must beat. GGUF
-builds are dequantized-loaded via transformers where supported, else evaluated with
-llama.cpp (harness noted per row, since windowing differs slightly).
+**Tooling finding:** quantized baselines do not load in the transformers harness for this
+brand-new `qwen3_5_moe` arch — GGUF isn't mapped (verified from the GGUF header), and the
+AWQ build trips gptqmodel's Marlin kernel. So the imatrix bar (unsloth GGUF) is inherently a
+**llama.cpp** measurement, deferred. This does *not* block the core study: VPTQ output is
+transformers-native, so the codebook-vs-fp16 comparison stays in one harness; the imatrix
+cross-comparison becomes a final delta-from-fp16 step via llama.cpp.
 
 ### Phase 2 — expert-usage profiling (Qwen3.6-35B-A3B, 512 C4 rows, A100, transformers 5.14.1)
 
