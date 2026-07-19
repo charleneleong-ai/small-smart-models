@@ -144,7 +144,14 @@ Caveat: single calibration domain (C4) — domain-specific calibration could shi
    `nn.Linear` router and the >=5 `Qwen3MoeTopKRouter` refactor, plus the multimodal
    nesting) — see [`smart_quant.expert_importance`](../../src/smart_quant/expert_importance.py).
    Verified on the A100 against a real transformers-5 Qwen3-MoE module tree.
-3. **Encode** — VPTQ uniform, then expert-aware, at the IQ2_M budget.
+3. **Encode** — hand-rolled product-quantization codebook on the expert FFNs
+   ([`smart_quant.codebook`](../../src/smart_quant/codebook.py)), uniform then
+   expert-importance allocation. *Pivot from VPTQ:* its quantizer is a separate algorithm
+   branch with no `qwen3_5_moe` support, and this arch has blocked every quant path (GGUF,
+   AWQ) — a weight-level PQ is arch-agnostic and more instructive. *Finding:* per-group
+   fp16 codebooks are overhead-heavy (~4 bpw on 2048×512 experts, since codebook storage
+   ≈ index storage at that size); reaching ~2 bpw needs **codebook sharing across
+   groups/experts** — the next increment, and where importance-aware sharing re-enters.
 4. **Measure** — same harness; footprint-matched comparison table + quality-vs-bpw plot.
 5. **Write up** — `docs/experiments/vptq-vs-imatrix.md`, W&B run group `ssm-vptq`.
 
