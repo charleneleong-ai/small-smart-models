@@ -100,6 +100,17 @@ The project succeeds on a *clear answer*, not on VPTQ winning:
 
 ## Results
 
+### Phase 1 — baselines (wikitext-2 perplexity, transformers sliding-window 4096/2048, A100)
+
+| build | wikitext-2 ppl | footprint |
+|---|---|---|
+| fp16 | **5.92** | ~70 GB |
+| UD-IQ2_M (~2.6 bpw) | _pending_ | 11.5 GB |
+
+fp16 is the quality ceiling; UD-IQ2_M is the exact bar the VPTQ encode must beat. GGUF
+builds are dequantized-loaded via transformers where supported, else evaluated with
+llama.cpp (harness noted per row, since windowing differs slightly).
+
 ### Phase 2 — expert-usage profiling (Qwen3.6-35B-A3B, 512 C4 rows, A100, transformers 5.14.1)
 
 All 40 MoE layers profiled (256 experts, top-8 routing). Usage is **moderately skewed**, not
