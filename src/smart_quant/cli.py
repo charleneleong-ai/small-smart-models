@@ -33,25 +33,38 @@ def budget(
     console.print(f"target: [bold]{b:,} bytes[/bold] ({b/1024**3:.2f} GiB) at {bpw} bpw")
 
 
-@app.command()
-def ppl(
+@app.command("eval")
+def eval_model(
     model: str = typer.Option(..., help="HF repo id or local path."),
-    device: str = typer.Option("cuda"),
+    label: str = typer.Option(..., help="Row label, e.g. fp16 / iq2_m / vptq-2bit."),
+    gguf_file: str = typer.Option(None, help="GGUF filename within the repo (dequantized load)."),
+    dataset: str = typer.Option("wikitext-2-raw-v1"),
     max_length: int = typer.Option(4096),
     stride: int = typer.Option(2048),
+    out: Path = typer.Option(Path("experiments/bits-per-brain/results.jsonl")),
 ) -> None:
-    """Sliding-window perplexity on wikitext-2 (fast quality smoke test)."""
-    from datasets import load_dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """Sliding-window wikitext perplexity for one model; append a row to results.jsonl."""
+    import json
 
-    from smart_quant.eval import sliding_window_perplexity
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    from smart_quant.eval import load_causal_lm, sliding_window_perplexity
 
     tok = AutoTokenizer.from_pretrained(model)
-    lm = AutoModelForCausalLM.from_pretrained(model, torch_dtype="auto", device_map=device)
-    data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    text = "\n\n".join(data["text"])
-    score = sliding_window_perplexity(lm, tok, text, max_length, stride, device)
-    console.print(f"wikitext-2 perplexity: [bold]{score:.3f}[/bold]")
+    load_kwargs = {"dtype": "auto", "device_map": "cuda"}
+    if gguf_file:
+        load_kwargs["gguf_file"] = gguf_file
+    lm = load_causal_lm(model, **load_kwargs).eval()
+    text = "\n\n".join(load_dataset("wikitext", dataset, split="test")["text"])
+    ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
+
+    row = {"label": label, "model": model, "gguf_file": gguf_file,
+           "wikitext_ppl": round(ppl, 4), "dataset": dataset}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    console.print(f"[bold]{label}[/bold]  wikitext-2 ppl = [bold]{ppl:.4f}[/bold]  ->  {out}")
 
 
 @app.command("profile-experts")

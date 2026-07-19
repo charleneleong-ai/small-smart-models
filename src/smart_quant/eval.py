@@ -7,6 +7,17 @@ from pathlib import Path
 import torch
 
 
+def load_causal_lm(model_id: str, **kwargs):
+    """Load a text-generation model, tolerating multimodal ConditionalGeneration archs
+    (e.g. Qwen3.5-MoE) that `AutoModelForCausalLM` does not map to a CausalLM class."""
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    except (ValueError, KeyError):
+        return AutoModelForImageTextToText.from_pretrained(model_id, **kwargs)
+
+
 def sliding_window_perplexity(
     model,
     tokenizer,
