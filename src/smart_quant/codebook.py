@@ -20,15 +20,17 @@ __all__ = ["lloyd_kmeans", "pq_quantize", "pq_dequantize", "pq_bpw"]
 
 def lloyd_kmeans(x: torch.Tensor, k: int, iters: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
     """Lloyd's k-means over rows of x (n, d), deterministic linspace init. Returns
-    (centroids (k, d), assignment (n,)). Empty clusters keep their previous centroid."""
+    (centroids (k, d), assignment (n,)). Empty clusters keep their previous centroid.
+    Centroid update is vectorized (index_add) — no Python loop over k."""
     n = x.shape[0]
     centroids = x[torch.linspace(0, n - 1, k).round().long()].clone()
+    ones = torch.ones(n, device=x.device, dtype=x.dtype)
     for _ in range(iters):
         idx = torch.cdist(x, centroids).argmin(dim=1)
-        for j in range(k):
-            mask = idx == j
-            if mask.any():
-                centroids[j] = x[mask].mean(dim=0)
+        sums = torch.zeros_like(centroids).index_add_(0, idx, x)
+        counts = torch.zeros(k, device=x.device, dtype=x.dtype).index_add_(0, idx, ones)
+        nonempty = counts > 0
+        centroids[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1)
     idx = torch.cdist(x, centroids).argmin(dim=1)
     return centroids, idx
 
