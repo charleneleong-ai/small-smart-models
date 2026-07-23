@@ -136,6 +136,30 @@ edge over uniform codebook) may be smaller than the "MoE usage is heavily skewed
 a small gap would itself be a finding. Artifact: `experiments/bits-per-brain/expert_freq.pt` (box).
 Caveat: single calibration domain (C4) — domain-specific calibration could shift the hot set.
 
+### Phase 3 — codebook encode (shared-codebook product quantization on expert FFNs, ~2 bpw, A100)
+
+Fake-quantized the routed expert FFNs (all 40 layers, `sub_dim` 4), wikitext-2 perplexity vs
+the fp16 5.92 ceiling:
+
+| build | allocation | per-expert bits | wikitext-2 ppl | Δ vs fp16 |
+|---|---|---|---|---|
+| fp16 | — | — | 5.92 | — |
+| pq2-uniform | uniform | 2.0 | **6.77** | +14% |
+| pq2-expert | usage-driven | 1.5–3.0 | **7.68** | +30% |
+
+**Headline: expert-importance allocation *hurt* — 7.68 vs uniform's 6.77.** The [1.5, 3.0]
+span confirms the allocation varied (not a wiring bug); concentrating bits on hot experts and
+starving cold ones lost more than it gained. This confirms the phase-2 prediction: usage is
+only *moderately* skewed (entropy 0.90), so cold experts still carry real traffic and can't be
+starved, and the bits→error curve is convex, making uniform near-optimal when importances are
+close. The naive "expert-aware wins" intuition fails at this scale — a real, against-intuition
+result.
+
+Caveats: fake-quant (dequantized weights) + perplexity + one dataset; a *gentler* allocation
+range than [1.5, 3.0] might avoid the loss (untested). The imatrix cross-comparison (unsloth
+UD-IQ2_M) remains the deferred llama.cpp step, so this is codebook-uniform-vs-expert, not yet
+codebook-vs-imatrix.
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)
