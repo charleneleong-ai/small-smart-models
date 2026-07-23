@@ -22,6 +22,16 @@ class TestProductQuantization:
         assert pq_dequantize(codes_s, cb_s).shape == (128, 32)
         assert pq_dequantize(codes_p, cb_p).shape == (128, 32)
 
+    def test_max_fit_subsample_still_reconstructs_closely(self):
+        torch.manual_seed(3)
+        w = torch.randn(1024, 64)
+        codes_full, cb_full = pq_quantize(w, 4, 256, iters=10)
+        codes_sub, cb_sub = pq_quantize(w, 4, 256, iters=10, max_fit=2048)
+        assert codes_sub.shape == codes_full.shape  # every sub-vector still assigned
+        err_full = (pq_dequantize(codes_full, cb_full) - w).pow(2).mean()
+        err_sub = (pq_dequantize(codes_sub, cb_sub) - w).pow(2).mean()
+        assert err_sub < 1.5 * err_full  # fitting on a subsample barely costs quality
+
     def test_non_divisible_raises(self):
         with pytest.raises(ValueError):
             pq_quantize(torch.randn(8, 30), sub_dim=4, n_centroids=16)

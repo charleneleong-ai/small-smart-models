@@ -39,10 +39,14 @@ def pq_quantize(
     n_centroids: int,
     iters: int = 10,
     share_codebook: bool = True,
+    max_fit: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Product-quantize a (out, in) weight. Returns (codes (out, groups) long, codebooks).
     With share_codebook, one codebook is fit over all sub-vectors -> codebooks is
-    (n_centroids, sub_dim); otherwise one per group -> (groups, n_centroids, sub_dim)."""
+    (n_centroids, sub_dim); otherwise one per group -> (groups, n_centroids, sub_dim).
+    max_fit caps how many sub-vectors the shared codebook is *fit* on (a strided subsample);
+    all sub-vectors are still assigned. This keeps k-means tractable at scale — fit cost
+    drops from ~500k points/expert to max_fit, while assignment is a single pass."""
     out, in_ = weight.shape
     if in_ % sub_dim:
         raise ValueError(f"in_features {in_} not divisible by sub_dim {sub_dim}")
@@ -50,7 +54,12 @@ def pq_quantize(
     subvecs = weight.reshape(out, groups, sub_dim)
 
     if share_codebook:
-        centroids, idx = lloyd_kmeans(subvecs.reshape(-1, sub_dim).float(), n_centroids, iters)
+        pool = subvecs.reshape(-1, sub_dim).float()
+        fit = pool
+        if max_fit is not None and pool.shape[0] > max_fit:
+            fit = pool[torch.linspace(0, pool.shape[0] - 1, max_fit).round().long()]
+        centroids = lloyd_kmeans(fit, n_centroids, iters)[0]
+        idx = torch.cdist(pool, centroids).argmin(dim=1)
         return idx.reshape(out, groups), centroids.to(weight.dtype)
 
     codes = torch.empty(out, groups, dtype=torch.long)

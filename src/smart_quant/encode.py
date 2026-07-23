@@ -29,7 +29,10 @@ def quantize_fused_experts(
     each expert at its own `bits_per_expert` budget."""
     for e in range(weight.shape[0]):
         n_centroids = centroids_for_bits(float(bits_per_expert[e]), sub_dim)
-        codes, codebook = pq_quantize(weight[e], sub_dim, n_centroids, iters=iters)
+        # fit the codebook on a bounded subsample (>= a healthy multiple of the codebook
+        # size) so k-means stays fast on large expert weights; all sub-vectors still assigned
+        max_fit = max(4096, n_centroids * 8)
+        codes, codebook = pq_quantize(weight[e], sub_dim, n_centroids, iters=iters, max_fit=max_fit)
         weight[e] = pq_dequantize(codes, codebook).to(weight.dtype)
     return weight
 
