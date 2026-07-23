@@ -8,12 +8,21 @@ reflect quantized weights for quality measurement without custom inference kerne
 """
 from __future__ import annotations
 
+import re
+
 import torch
 
 from smart_quant.codebook import pq_dequantize, pq_quantize
 from smart_quant.expert_importance import bits_from_frequency
 
-__all__ = ["centroids_for_bits", "quantize_fused_experts", "quantize_experts"]
+__all__ = ["layer_index", "centroids_for_bits", "quantize_fused_experts", "quantize_experts"]
+
+
+def layer_index(name: str) -> int | None:
+    """Extract the decoder-layer index from a module/param name (`...layers.<N>...`), so
+    routers and experts can be matched by layer regardless of model-wrapper name prefixes."""
+    m = re.search(r"layers\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
 
 
 def centroids_for_bits(bits: float, sub_dim: int, lo: int = 16, hi: int = 4096) -> int:
@@ -43,6 +52,7 @@ def quantize_experts(
     """Walk a model's fused MoE expert modules and fake-quantize them. With `freqs` (router
     name -> usage frequencies), per-expert bits are water-filled to `avg_bits` by usage;
     otherwise every expert gets `avg_bits`. Returns per-layer allocation stats."""
+    freq_by_layer = {layer_index(k): v for k, v in freqs.items()} if freqs else {}
     stats = []
     for name, module in model.named_modules():
         if not type(module).__name__.endswith("Experts"):
@@ -51,7 +61,7 @@ def quantize_experts(
         if not fused:
             continue
         n_experts = fused[0].shape[0]
-        freq = freqs.get(f"{name.rsplit('.experts', 1)[0]}.gate") if freqs else None
+        freq = freq_by_layer.get(layer_index(name))
         if freq is not None and len(freq) == n_experts:
             bits = bits_from_frequency(freq, avg_bits)
         else:

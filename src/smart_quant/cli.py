@@ -69,6 +69,49 @@ def eval_model(
     console.print(f"[bold]{label}[/bold]  wikitext-2 ppl = [bold]{ppl:.4f}[/bold]  ->  {out}")
 
 
+@app.command("encode-eval")
+def encode_eval(
+    model: str = typer.Option(..., help="HF repo id or local path (fp16)."),
+    label: str = typer.Option(..., help="Row label, e.g. pq2-uniform / pq2-expert."),
+    avg_bits: float = typer.Option(2.0, help="Target average bits/weight for the experts."),
+    sub_dim: int = typer.Option(4),
+    allocation: str = typer.Option("uniform", help="uniform | expert (usage-driven)."),
+    freqs_path: Path = typer.Option(Path("experiments/bits-per-brain/expert_freq.pt")),
+    dataset: str = typer.Option("Salesforce/wikitext"),
+    config: str = typer.Option("wikitext-2-raw-v1"),
+    max_length: int = typer.Option(4096),
+    stride: int = typer.Option(2048),
+    out: Path = typer.Option(Path("experiments/bits-per-brain/results.jsonl")),
+) -> None:
+    """Fake-quantize the expert FFNs (uniform or expert-importance allocation), then measure
+    wikitext perplexity; append a row to results.jsonl."""
+    import json
+
+    import torch
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    from smart_quant.encode import quantize_experts
+    from smart_quant.eval import load_causal_lm, sliding_window_perplexity
+
+    tok = AutoTokenizer.from_pretrained(model)
+    text = "\n\n".join(load_dataset(dataset, config, split="test")["text"])
+    lm = load_causal_lm(model, dtype="auto", device_map="cuda").eval()
+    freqs = torch.load(freqs_path, weights_only=True) if allocation == "expert" else None
+    stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs)
+    span = [round(min(s["bits_min"] for s in stats), 2), round(max(s["bits_max"] for s in stats), 2)]
+    ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
+
+    row = {"label": label, "model": model, "allocation": allocation, "avg_bits": avg_bits,
+           "sub_dim": sub_dim, "wikitext_ppl": round(ppl, 4), "moe_layers": len(stats),
+           "per_expert_bits_span": span}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    console.print(f"[bold]{label}[/bold] ({allocation}, ~{avg_bits}bpw)  "
+                  f"wikitext ppl = [bold]{ppl:.4f}[/bold]  ->  {out}")
+
+
 @app.command("profile-experts")
 def profile_experts(
     model: str = typer.Option(..., help="HF repo id or local path."),
