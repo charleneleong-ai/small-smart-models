@@ -145,15 +145,18 @@ the fp16 5.92 ceiling:
 |---|---|---|---|---|
 | fp16 | — | — | 5.92 | — |
 | pq2-uniform | uniform | 2.0 | **6.77** | +14% |
-| pq2-expert | usage-driven | 1.5–3.0 | **7.68** | +30% |
+| pq2-expert-gentle | usage-driven | 1.8–2.3 | 7.07 | +19% |
+| pq2-expert | usage-driven | 1.5–3.0 | 7.68 | +30% |
 
-**Headline: expert-importance allocation *hurt* — 7.68 vs uniform's 6.77.** The [1.5, 3.0]
-span confirms the allocation varied (not a wiring bug); concentrating bits on hot experts and
-starving cold ones lost more than it gained. This confirms the phase-2 prediction: usage is
-only *moderately* skewed (entropy 0.90), so cold experts still carry real traffic and can't be
-starved, and the bits→error curve is convex, making uniform near-optimal when importances are
-close. The naive "expert-aware wins" intuition fails at this scale — a real, against-intuition
-result.
+**Headline: expert-importance allocation is *counterproductive*, monotonically in strength —
+uniform (6.77) < gentle 1.8–2.3 (7.07) < aggressive 1.5–3.0 (7.68).** Even mild reallocation
+loses to uniform, and more reallocation loses more, so this is not an over-aggressiveness
+artifact: usage-driven bit allocation fundamentally does not help at this skew. Textbook
+convexity explains it — reconstruction error is convex in bits, so by Jensen spreading bits
+unequally raises the usage-weighted error *unless* the skew is strong enough to overcome the
+penalty. At entropy 0.90 (phase 2) it is not, so uniform is near-optimal and any deviation
+hurts. The naive "spend bits where they're used" intuition fails on a moderately-skewed
+3B-active MoE — a clean, against-intuition result.
 
 Caveats: fake-quant (dequantized weights) + perplexity + one dataset; a *gentler* allocation
 range than [1.5, 3.0] might avoid the loss (untested). The imatrix cross-comparison (unsloth
