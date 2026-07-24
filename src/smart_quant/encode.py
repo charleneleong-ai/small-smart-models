@@ -47,11 +47,12 @@ def quantize_fused_experts(
 
 
 def quantize_experts(
-    model, avg_bits: float, sub_dim: int = 4, freqs: dict | None = None, iters: int = 10
+    model, avg_bits: float, sub_dim: int = 4, freqs: dict | None = None, iters: int = 10,
+    bits_lo: float = 1.5, bits_hi: float = 3.0,
 ) -> list[dict]:
     """Walk a model's fused MoE expert modules and fake-quantize them. With `freqs` (router
-    name -> usage frequencies), per-expert bits are water-filled to `avg_bits` by usage;
-    otherwise every expert gets `avg_bits`. Returns per-layer allocation stats."""
+    name -> usage frequencies), per-expert bits are water-filled to `avg_bits` by usage within
+    [bits_lo, bits_hi]; otherwise every expert gets `avg_bits`. Returns per-layer stats."""
     freq_by_layer = {layer_index(k): v for k, v in freqs.items()} if freqs else {}
     stats = []
     for name, module in model.named_modules():
@@ -63,7 +64,7 @@ def quantize_experts(
         n_experts = fused[0].shape[0]
         freq = freq_by_layer.get(layer_index(name))
         if freq is not None and len(freq) == n_experts:
-            bits = bits_from_frequency(freq, avg_bits)
+            bits = bits_from_frequency(freq, avg_bits, lo=bits_lo, hi=bits_hi)
         else:
             bits = torch.full((n_experts,), float(avg_bits))
         with torch.no_grad():

@@ -76,6 +76,8 @@ def encode_eval(
     avg_bits: float = typer.Option(2.0, help="Target average bits/weight for the experts."),
     sub_dim: int = typer.Option(4),
     allocation: str = typer.Option("uniform", help="uniform | expert (usage-driven)."),
+    bits_lo: float = typer.Option(1.5, help="Min per-expert bits (expert allocation)."),
+    bits_hi: float = typer.Option(3.0, help="Max per-expert bits (expert allocation)."),
     freqs_path: Path = typer.Option(Path("experiments/bits-per-brain/expert_freq.pt")),
     dataset: str = typer.Option("Salesforce/wikitext"),
     config: str = typer.Option("wikitext-2-raw-v1"),
@@ -98,7 +100,8 @@ def encode_eval(
     text = "\n\n".join(load_dataset(dataset, config, split="test")["text"])
     lm = load_causal_lm(model, dtype="auto", device_map="cuda").eval()
     freqs = torch.load(freqs_path, weights_only=True) if allocation == "expert" else None
-    stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs)
+    stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs,
+                             bits_lo=bits_lo, bits_hi=bits_hi)
     span = [round(min(s["bits_min"] for s in stats), 2), round(max(s["bits_max"] for s in stats), 2)]
     ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
 
