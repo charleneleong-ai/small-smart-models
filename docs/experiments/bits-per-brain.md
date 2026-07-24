@@ -163,6 +163,30 @@ range than [1.5, 3.0] might avoid the loss (untested). The imatrix cross-compari
 UD-IQ2_M) remains the deferred llama.cpp step, so this is codebook-uniform-vs-expert, not yet
 codebook-vs-imatrix.
 
+### Phase 4 — imatrix comparison (llama.cpp, wikitext-2, 40-chunk subset)
+
+The original question: does codebook 2-bit beat imatrix 2-bit? Both measured as degradation
+from a near-lossless reference *in their own harness* (the delta normalizes the harness offset
+— Q8 llama.cpp 6.02 vs fp16 transformers 5.92 agree to ~0.1, confirming comparability):
+
+| method | build | bpw | ppl | reference | Δ degradation |
+|---|---|---|---|---|---|
+| imatrix (scalar) | unsloth UD-IQ2_M | ~2.6 | 6.49 | Q8 6.02 | **+0.47 (+7.8%)** |
+| codebook (naive PQ) | pq2-uniform | 2.0 | 6.77 | fp16 5.92 | +0.85 (+14.3%) |
+
+**Imatrix wins — roughly half the degradation.** Unsloth's importance-matrix + dynamic
+allocation IQ2_M degrades less than the from-scratch product-quantization codebook.
+
+Honest caveats: (1) **not equal footprint** — IQ2_M is ~2.6 bpw vs the PQ's 2.0, so imatrix
+has more bits; (2) the PQ is a **naive** k-means codebook — no second-order/Hessian
+optimization; real codebook methods (VPTQ/AQLM) would close much of the gap. So the verdict is
+"a mature scalar-imatrix quant beats a *naive* codebook at these budgets," not codebook-loses-
+in-general. The imatrix baseline is strong; beating it needs a sophisticated codebook, not an MVP.
+
+Nuance vs phase 3: imatrix's *dynamic* (importance-driven) allocation **helps** it, while the
+*expert-aware* codebook allocation **hurt** — coarse per-expert bit reallocation hits the
+codebook's convexity penalty, whereas imatrix's fine-grained per-weight importance does not.
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)
