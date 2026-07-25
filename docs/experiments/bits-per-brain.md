@@ -98,12 +98,52 @@ The project succeeds on a *clear answer*, not on VPTQ winning:
 - Produce VPTQ-uniform and VPTQ-expert-aware builds at the IQ2_M footprint.
 - State, with CIs, whether expert-aware VPTQ beats UD-IQ2_M — and by how much.
 
+## Results
+
+### Phase 1 — baselines (wikitext-2 perplexity, transformers sliding-window 4096/2048, A100)
+
+| build | wikitext-2 ppl | harness / status |
+|---|---|---|
+| fp16 | **5.92** | transformers ✅ |
+| AWQ-4bit (cyankiwi) | — | blocked: gptqmodel Marlin kernel rejects `out_features=32` |
+| UD-IQ2_M / Q2_K (~2.6 bpw) | — | GGUF arch `qwen35moe` unmapped by transformers → llama.cpp only |
+
+**Tooling finding:** quantized baselines do not load in the transformers harness for this
+brand-new `qwen3_5_moe` arch — GGUF isn't mapped (verified from the GGUF header), and the
+AWQ build trips gptqmodel's Marlin kernel. So the imatrix bar (unsloth GGUF) is inherently a
+**llama.cpp** measurement, deferred. This does *not* block the core study: VPTQ output is
+transformers-native, so the codebook-vs-fp16 comparison stays in one harness; the imatrix
+cross-comparison becomes a final delta-from-fp16 step via llama.cpp.
+
+### Phase 2 — expert-usage profiling (Qwen3.6-35B-A3B, 512 C4 rows, A100, transformers 5.14.1)
+
+All 40 MoE layers profiled (256 experts, top-8 routing). Usage is **moderately skewed**, not
+sharply concentrated:
+
+| metric | measured | uniform baseline |
+|---|---|---|
+| hottest-expert share (mean / max) | 2.58% / 3.52% | 0.39% |
+| top-8 experts' share (mean) | 15.3% | 3.1% |
+| normalized routing entropy (mean) | 0.901 | 1.000 |
+
+A stable hot set recurs across layers (globally hottest experts: 71, 206, 7, 95, 220, 14, 250,
+67), but entropy near 0.9 means the long tail still sees real traffic (~8.4M selections over 256
+experts — well-sampled, not undercounting).
+
+**Implication:** importance-aware bit allocation has *real but modest* signal — the hot experts
+warrant more bits, yet the tail isn't dead. So the uniform-vs-expert-aware gap (and imatrix's
+edge over uniform codebook) may be smaller than the "MoE usage is heavily skewed" prior assumed;
+a small gap would itself be a finding. Artifact: `experiments/bits-per-brain/expert_freq.pt` (box).
+Caveat: single calibration domain (C4) — domain-specific calibration could shift the hot set.
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)
-2. **Profile** — expert-usage histogram over calibration set. Router layers identified by
-   `out_features == num_experts` (256), robust to the multimodal nesting — see
-   [`smart_quant.expert_importance`](../../src/smart_quant/expert_importance.py).
+2. **Profile** ✅ — expert-usage histogram over calibration set. Routers identified by the MoE
+   block's `gate` submodule (name-matched, so it survives both the transformers <=4
+   `nn.Linear` router and the >=5 `Qwen3MoeTopKRouter` refactor, plus the multimodal
+   nesting) — see [`smart_quant.expert_importance`](../../src/smart_quant/expert_importance.py).
+   Verified on the A100 against a real transformers-5 Qwen3-MoE module tree.
 3. **Encode** — VPTQ uniform, then expert-aware, at the IQ2_M budget.
 4. **Measure** — same harness; footprint-matched comparison table + quality-vs-bpw plot.
 5. **Write up** — `docs/experiments/vptq-vs-imatrix.md`, W&B run group `ssm-vptq`.
