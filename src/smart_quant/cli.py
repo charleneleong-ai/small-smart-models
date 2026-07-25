@@ -96,6 +96,7 @@ def encode_eval(
     from smart_quant.encode import quantize_experts
     from smart_quant.eval import load_causal_lm, sliding_window_perplexity
 
+    # dataset first, so a bad id fails fast rather than after the multi-minute model load
     tok = AutoTokenizer.from_pretrained(model)
     text = "\n\n".join(load_dataset(dataset, config, split="test")["text"])
     lm = load_causal_lm(model, dtype="auto", device_map="cuda").eval()
