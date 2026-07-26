@@ -136,6 +136,57 @@ edge over uniform codebook) may be smaller than the "MoE usage is heavily skewed
 a small gap would itself be a finding. Artifact: `experiments/bits-per-brain/expert_freq.pt` (box).
 Caveat: single calibration domain (C4) — domain-specific calibration could shift the hot set.
 
+### Phase 3 — codebook encode (shared-codebook product quantization on expert FFNs, ~2 bpw, A100)
+
+Fake-quantized the routed expert FFNs (all 40 layers, `sub_dim` 4), wikitext-2 perplexity vs
+the fp16 5.92 ceiling:
+
+| build | allocation | per-expert bits | wikitext-2 ppl | Δ vs fp16 |
+|---|---|---|---|---|
+| fp16 | — | — | 5.92 | — |
+| pq2-uniform | uniform | 2.0 | **6.77** | +14% |
+| pq2-expert-gentle | usage-driven | 1.8–2.3 | 7.07 | +19% |
+| pq2-expert | usage-driven | 1.5–3.0 | 7.68 | +30% |
+
+**Headline: expert-importance allocation is *counterproductive*, monotonically in strength —
+uniform (6.77) < gentle 1.8–2.3 (7.07) < aggressive 1.5–3.0 (7.68).** Even mild reallocation
+loses to uniform, and more reallocation loses more, so this is not an over-aggressiveness
+artifact: usage-driven bit allocation fundamentally does not help at this skew. Textbook
+convexity explains it — reconstruction error is convex in bits, so by Jensen spreading bits
+unequally raises the usage-weighted error *unless* the skew is strong enough to overcome the
+penalty. At entropy 0.90 (phase 2) it is not, so uniform is near-optimal and any deviation
+hurts. The naive "spend bits where they're used" intuition fails on a moderately-skewed
+3B-active MoE — a clean, against-intuition result.
+
+Caveats: fake-quant (dequantized weights) + perplexity + one dataset; a *gentler* allocation
+range than [1.5, 3.0] might avoid the loss (untested). The imatrix cross-comparison (unsloth
+UD-IQ2_M) remains the deferred llama.cpp step, so this is codebook-uniform-vs-expert, not yet
+codebook-vs-imatrix.
+
+### Phase 4 — imatrix comparison (llama.cpp, wikitext-2, 40-chunk subset)
+
+The original question: does codebook 2-bit beat imatrix 2-bit? Both measured as degradation
+from a near-lossless reference *in their own harness* (the delta normalizes the harness offset
+— Q8 llama.cpp 6.02 vs fp16 transformers 5.92 agree to ~0.1, confirming comparability):
+
+| method | build | bpw | ppl | reference | Δ degradation |
+|---|---|---|---|---|---|
+| imatrix (scalar) | unsloth UD-IQ2_M | ~2.6 | 6.49 | Q8 6.02 | **+0.47 (+7.8%)** |
+| codebook (naive PQ) | pq2-uniform | 2.0 | 6.77 | fp16 5.92 | +0.85 (+14.3%) |
+
+**Imatrix wins — roughly half the degradation.** Unsloth's importance-matrix + dynamic
+allocation IQ2_M degrades less than the from-scratch product-quantization codebook.
+
+Honest caveats: (1) **not equal footprint** — IQ2_M is ~2.6 bpw vs the PQ's 2.0, so imatrix
+has more bits; (2) the PQ is a **naive** k-means codebook — no second-order/Hessian
+optimization; real codebook methods (VPTQ/AQLM) would close much of the gap. So the verdict is
+"a mature scalar-imatrix quant beats a *naive* codebook at these budgets," not codebook-loses-
+in-general. The imatrix baseline is strong; beating it needs a sophisticated codebook, not an MVP.
+
+Nuance vs phase 3: imatrix's *dynamic* (importance-driven) allocation **helps** it, while the
+*expert-aware* codebook allocation **hurt** — coarse per-expert bit reallocation hits the
+codebook's convexity penalty, whereas imatrix's fine-grained per-weight importance does not.
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)
@@ -144,7 +195,14 @@ Caveat: single calibration domain (C4) — domain-specific calibration could shi
    `nn.Linear` router and the >=5 `Qwen3MoeTopKRouter` refactor, plus the multimodal
    nesting) — see [`smart_quant.expert_importance`](../../src/smart_quant/expert_importance.py).
    Verified on the A100 against a real transformers-5 Qwen3-MoE module tree.
-3. **Encode** — VPTQ uniform, then expert-aware, at the IQ2_M budget.
+3. **Encode** — hand-rolled product-quantization codebook on the expert FFNs
+   ([`smart_quant.codebook`](../../src/smart_quant/codebook.py)), uniform then
+   expert-importance allocation. *Pivot from VPTQ:* its quantizer is a separate algorithm
+   branch with no `qwen3_5_moe` support, and this arch has blocked every quant path (GGUF,
+   AWQ) — a weight-level PQ is arch-agnostic and more instructive. *Finding:* per-group
+   fp16 codebooks are overhead-heavy (~4 bpw on 2048×512 experts, since codebook storage
+   ≈ index storage at that size); reaching ~2 bpw needs **codebook sharing across
+   groups/experts** — the next increment, and where importance-aware sharing re-enters.
 4. **Measure** — same harness; footprint-matched comparison table + quality-vs-bpw plot.
 5. **Write up** — `docs/experiments/vptq-vs-imatrix.md`, W&B run group `ssm-vptq`.
 
