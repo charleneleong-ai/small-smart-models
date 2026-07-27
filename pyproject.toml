@@ -19,6 +19,12 @@ dependencies = [
 [project.optional-dependencies]
 quant = ["vptq>=0.0.5", "aqlm>=1.1"]
 
+# CI test surface. The unit suite exercises the pure-torch core
+# (footprint/codebook/encode/expert_importance) only; transformers/datasets and the
+# eval+cli study paths run on the GPU box, not in CI — so this stays torch + pytest.
+[dependency-groups]
+test = ["pytest>=8", "torch>=2.4"]
+
 [project.scripts]
 smart-quant = "smart_quant.cli:app"
 
