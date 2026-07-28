@@ -217,8 +217,36 @@ sits.
 This flips phase 4's "beating imatrix needs a sophisticated codebook" caveat: even a *naive* PQ
 clears it once the footprint is matched. Same honest caveats carry over — fake-quant, perplexity,
 one dataset — and the imatrix point is a single normalized measurement, not a swept curve, so the
-3.2 pp margin is indicative rather than a tight CI. A second-order codebook (VPTQ/AQLM) would only
-widen it.
+3.2 pp margin is indicative rather than a tight CI. Whether a second-order codebook widens that
+margin is tested in phase 6 — at matched footprint it does not.
+
+### Phase 6 — residual vector quantization (second-order, matched footprint)
+
+Phase 5 guessed a second-order codebook "would only widen" PQ's margin. Phase 6 tests it directly:
+does splitting each expert's index budget across **two** residual stages — stage 0 quantizes the
+weight, stage 1 the running residual — beat a single first-order codebook at the **same** footprint?
+The budget is held fixed (`sub_dim=4`, index bits split evenly via `centroids_for_bits(bits/order,
+sub_dim)`), so two stages are if anything *cheaper* to store — two smaller fp16 codebooks. See the
+`codebook_order` knob on [`smart_quant.encode.quantize_fused_experts`](../../src/smart_quant/encode.py)
+and [`residual_pq_quantize`](../../src/smart_quant/codebook.py).
+
+At `order=2` the even split snaps `expert_bpw` onto a coarse ~0.5-step grid — {2.00, 2.50, 3.00} at
+k={16, 32, 64} per stage — so the 2.6 target is unreachable; the upper point sits at 2.50, honestly
+under the imatrix budget. Points pair by realized position: rvq20 vs pq2 (~2.0), rvq25 vs pq25 (~2.5).
+
+| footprint | first-order PQ (ppl) | residual order=2 (ppl) | first-order wins by |
+|---|---|---|---|
+| ~2.0 bpw | pq2 (2.00) 6.77 | rvq20 (2.00) 7.45 | 0.68 |
+| ~2.5 bpw | pq25 (2.54) 6.21 | rvq25 (2.50) 6.54 | 0.32 |
+
+**At matched footprint, residual order=2 VQ underperforms first-order PQ across the whole 2.0–2.5
+band** (the purple line above), and rvq25 (6.54) also loses to imatrix (6.38). Splitting the same
+index budget across two stages leaves each stage too coarse — k=16 at 2.0, k=32 at 2.5 — and the
+extra stage's gain never repays the halved per-stage resolution. The gap narrows with bpw
+(0.68 → 0.32) but does not close by 2.5. This reverses the phase-5 hunch: a *matched-budget* second
+codebook does not widen the margin. A true *additive* second codebook (more bits, not the same bits
+re-split) is a different, unmatched comparison and out of scope. Design:
+[`docs/specs/2026-07-28-residual-vq-phase6-design.md`](../specs/2026-07-28-residual-vq-phase6-design.md).
 
 ## Phases
 
