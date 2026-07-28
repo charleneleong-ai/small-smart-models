@@ -13,6 +13,8 @@ uv.lock
 experiments/**/results.jsonl
 experiments/**/*.png
 experiments/**/*.html
+# committed PR screenshots (matplotlib mirrors) are the exception
+!experiments/progress/**/*.png
 wandb/
 outputs/
 
