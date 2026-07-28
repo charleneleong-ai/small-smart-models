@@ -104,15 +104,25 @@ def encode_eval(
     stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs,
                              bits_lo=bits_lo, bits_hi=bits_hi)
     span = [round(min(s["bits_min"] for s in stats), 2), round(max(s["bits_max"] for s in stats), 2)]
+
+    # Realized footprint: expert_bpw is the honest per-weight cost of the quantized experts
+    # (indices + shared codebook) — the quantity to match against imatrix/GGUF targets. model_bpw
+    # folds in the still-fp16 non-experts, so it's higher and only comparable to whole-model quants.
+    expert_bits = sum(s["quant_bits"] for s in stats)
+    expert_weights = sum(s["quant_weights"] for s in stats)
+    total_params = sum(p.numel() for p in lm.parameters())
+    expert_bpw = expert_bits / expert_weights
+    model_bpw = (expert_bits + (total_params - expert_weights) * 16) / total_params
     ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
 
     row = {"label": label, "model": model, "allocation": allocation, "avg_bits": avg_bits,
            "sub_dim": sub_dim, "wikitext_ppl": round(ppl, 4), "moe_layers": len(stats),
-           "per_expert_bits_span": span}
+           "per_expert_bits_span": span, "expert_bpw": round(expert_bpw, 3),
+           "model_bpw": round(model_bpw, 3)}
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("a") as f:
         f.write(json.dumps(row) + "\n")
-    console.print(f"[bold]{label}[/bold] ({allocation}, ~{avg_bits}bpw)  "
+    console.print(f"[bold]{label}[/bold] ({allocation}, ~{avg_bits}bpw -> {expert_bpw:.3f} expert bpw)  "
                   f"wikitext ppl = [bold]{ppl:.4f}[/bold]  ->  {out}")
 
 
