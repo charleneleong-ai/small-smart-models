@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from smart_quant.codebook import pq_bpw, pq_dequantize, pq_quantize
+from smart_quant.codebook import pq_bpw, pq_dequantize, pq_quantize, residual_pq_quantize
 
 
 class TestProductQuantization:
@@ -47,3 +47,23 @@ class TestBpw:
         shared = pq_bpw(2048, 512, 4, 256, share_codebook=True)
         pergroup = pq_bpw(2048, 512, 4, 256, share_codebook=False)
         assert pergroup > 1.9 * shared
+
+
+class TestResidualQuantization:
+    def test_residual_stage_reduces_error(self):
+        torch.manual_seed(0)
+        w = torch.randn(256, 64)
+        codes1, cb1 = residual_pq_quantize(w, sub_dim=4, stage_centroids=[64])
+        codes2, cb2 = residual_pq_quantize(w, sub_dim=4, stage_centroids=[64, 64])
+        err1 = (pq_dequantize(codes1[0], cb1[0]) - w).pow(2).mean().item()
+        recon2 = pq_dequantize(codes2[0], cb2[0]) + pq_dequantize(codes2[1], cb2[1])
+        err2 = (recon2 - w).pow(2).mean().item()
+        assert err2 < err1   # second stage strictly improves the reconstruction
+
+    def test_single_stage_matches_pq_quantize(self):
+        torch.manual_seed(1)
+        w = torch.randn(128, 32)
+        codes_r, cb_r = residual_pq_quantize(w, sub_dim=4, stage_centroids=[128])
+        codes_p, cb_p = pq_quantize(w, sub_dim=4, n_centroids=128)
+        assert torch.equal(codes_r[0], codes_p)
+        assert torch.equal(cb_r[0], cb_p)

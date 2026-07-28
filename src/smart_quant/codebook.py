@@ -15,7 +15,7 @@ import math
 
 import torch
 
-__all__ = ["lloyd_kmeans", "pq_quantize", "pq_dequantize", "pq_bpw"]
+__all__ = ["lloyd_kmeans", "pq_quantize", "pq_dequantize", "pq_bpw", "residual_pq_quantize"]
 
 
 def lloyd_kmeans(x: torch.Tensor, k: int, iters: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
@@ -81,6 +81,30 @@ def pq_dequantize(codes: torch.Tensor, codebooks: torch.Tensor) -> torch.Tensor:
     else:  # per-group
         recon = torch.stack([codebooks[g][codes[:, g]] for g in range(groups)], dim=1)
     return recon.reshape(out, -1)
+
+
+def residual_pq_quantize(
+    weight: torch.Tensor,
+    sub_dim: int,
+    stage_centroids: list[int],
+    iters: int = 10,
+    share_codebook: bool = True,
+    max_fit: int | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Multi-stage residual product quantization: stage 0 quantizes `weight`, each later
+    stage quantizes the running residual `weight - sum(recon so far)`. Returns per-stage
+    (codes_list, codebooks_list); `stage_centroids=[k]` reproduces a single `pq_quantize`."""
+    codes_list: list[torch.Tensor] = []
+    codebooks_list: list[torch.Tensor] = []
+    residual = weight
+    last = len(stage_centroids) - 1
+    for stage, k in enumerate(stage_centroids):
+        codes, codebook = pq_quantize(residual, sub_dim, k, iters, share_codebook, max_fit)
+        codes_list.append(codes)
+        codebooks_list.append(codebook)
+        if stage < last:  # final stage's residual is never read — skip the dequantize
+            residual = residual - pq_dequantize(codes, codebook).to(weight.dtype)
+    return codes_list, codebooks_list
 
 
 def pq_bpw(
