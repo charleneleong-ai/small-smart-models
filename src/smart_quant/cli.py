@@ -75,6 +75,7 @@ def encode_eval(
     label: str = typer.Option(..., help="Row label, e.g. pq2-uniform / pq2-expert."),
     avg_bits: float = typer.Option(2.0, help="Target average bits/weight for the experts."),
     sub_dim: int = typer.Option(4),
+    codebook_order: int = typer.Option(1, help="1 = single codebook; 2 = residual second-order."),
     allocation: str = typer.Option("uniform", help="uniform | expert (usage-driven)."),
     bits_lo: float = typer.Option(1.5, help="Min per-expert bits (expert allocation)."),
     bits_hi: float = typer.Option(3.0, help="Max per-expert bits (expert allocation)."),
@@ -102,7 +103,7 @@ def encode_eval(
     lm = load_causal_lm(model, dtype="auto", device_map="cuda").eval()
     freqs = torch.load(freqs_path, weights_only=True) if allocation == "expert" else None
     stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs,
-                             bits_lo=bits_lo, bits_hi=bits_hi)
+                             bits_lo=bits_lo, bits_hi=bits_hi, codebook_order=codebook_order)
     span = [round(min(s["bits_min"] for s in stats), 2), round(max(s["bits_max"] for s in stats), 2)]
 
     # Realized footprint: expert_bpw is the honest per-weight cost of the quantized experts
@@ -116,7 +117,8 @@ def encode_eval(
     ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
 
     row = {"label": label, "model": model, "allocation": allocation, "avg_bits": avg_bits,
-           "sub_dim": sub_dim, "wikitext_ppl": round(ppl, 4), "moe_layers": len(stats),
+           "sub_dim": sub_dim, "codebook_order": codebook_order,
+           "wikitext_ppl": round(ppl, 4), "moe_layers": len(stats),
            "per_expert_bits_span": span, "expert_bpw": round(expert_bpw, 3),
            "model_bpw": round(model_bpw, 3)}
     out.parent.mkdir(parents=True, exist_ok=True)
