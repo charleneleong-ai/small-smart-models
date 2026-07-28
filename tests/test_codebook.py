@@ -48,6 +48,19 @@ class TestBpw:
         pergroup = pq_bpw(2048, 512, 4, 256, share_codebook=False)
         assert pergroup > 1.9 * shared
 
+    def test_two_stages_sum_bpw(self):
+        one = pq_bpw(2048, 512, 4, 1024)
+        two = pq_bpw(2048, 512, 4, [32, 32])
+        # Two 5-bit stages carry the same index bits as one 10-bit stage, so the only
+        # difference is fp16 codebook storage: two 32-entry books cost less than one
+        # 1024-entry book, making the split strictly cheaper while both stay near 2.5 bpw.
+        assert two == pytest.approx(pq_bpw(2048, 512, 4, 32) * 2, rel=1e-6)
+        assert two < one
+        assert abs(two - one) < 0.1
+
+    def test_int_and_list_agree(self):
+        assert pq_bpw(2048, 512, 4, 256) == pq_bpw(2048, 512, 4, [256])
+
 
 class TestResidualQuantization:
     def test_residual_stage_reduces_error(self):
@@ -67,3 +80,10 @@ class TestResidualQuantization:
         codes_p, cb_p = pq_quantize(w, sub_dim=4, n_centroids=128)
         assert torch.equal(codes_r[0], codes_p)
         assert torch.equal(cb_r[0], cb_p)
+
+    def test_dequantize_sums_stages(self):
+        torch.manual_seed(2)
+        w = torch.randn(64, 32)
+        codes, cbs = residual_pq_quantize(w, sub_dim=4, stage_centroids=[32, 32])
+        manual = pq_dequantize(codes[0], cbs[0]) + pq_dequantize(codes[1], cbs[1])
+        assert torch.equal(pq_dequantize(codes, cbs), manual)
