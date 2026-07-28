@@ -34,6 +34,18 @@ class TestQuantizeFusedExperts:
         quantize_fused_experts(high, torch.full((2,), 3.0), sub_dim=4, iters=15)
         assert (high - base).norm() < (low - base).norm()
 
+    def test_order2_matches_footprint_and_reconstructs(self):
+        torch.manual_seed(2)
+        w = torch.randn(2, 1024, 512)
+        base = w.clone()
+        bits1, n1 = quantize_fused_experts(w.clone(), torch.full((2,), 2.6), sub_dim=4,
+                                           iters=5, codebook_order=1)
+        w2 = base.clone()
+        bits2, n2 = quantize_fused_experts(w2, torch.full((2,), 2.6), sub_dim=4,
+                                           iters=5, codebook_order=2)
+        assert bits2 / n2 == pytest.approx(bits1 / n1, abs=0.15)   # matched footprint
+        assert (w2 - base).norm() < base.norm()                    # a reconstruction
+
 
 class TestRealizedBpw:
     def test_accounts_exact_weights_and_near_nominal_bpw(self):
