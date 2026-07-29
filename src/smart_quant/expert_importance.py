@@ -7,8 +7,19 @@ they're used" advantage that importance-matrix GGUF gets structurally.
 """
 from __future__ import annotations
 
+import re
+from typing import Callable
+
 import torch
 from torch import nn
+
+
+def layer_index(name: str) -> int | None:
+    """Extract the decoder-layer index from a module/param name (`...layers.<N>...`), so
+    routers, experts and calibration artifacts can be matched by layer regardless of
+    model-wrapper name prefixes — `AutoModel` and `AutoModelForCausalLM` differ here."""
+    m = re.search(r"layers\.(\d+)\.", name)
+    return int(m.group(1)) if m else None
 
 
 class ExpertUsageProfiler:
@@ -63,6 +74,102 @@ class ExpertUsageProfiler:
     def frequencies(self) -> dict[str, torch.Tensor]:
         """Normalized selection frequency per expert, per layer."""
         return {name: c / c.sum().clamp(min=1) for name, c in self.counts.items()}
+
+
+class ActivationImportanceProfiler:
+    """Accumulates E[x^2] of each fused expert projection's input over a calibration set.
+
+    One forward-pre hook per `Experts` module suffices: transformers >=5 passes the routing in as
+    `forward(hidden_states, top_k_index, top_k_weights)`, so there is no router hook to pair with.
+
+    Keys are `"<layer_index>.<param_name>"` — the layer *index*, never the module path, so the
+    artifact survives the different wrapper prefixes `AutoModel` (the profiler) and
+    `AutoModelForCausalLM` (the encode) put on the same modules.
+
+    Arch coupling is deliberately confined to `make_hook`: fused params named
+    `gate_up_proj`/`down_proj`, and a SwiGLU packed **gate-first** so `chunk(2, -1)` splits it.
+    The name assumptions fail loudly; the packing assumption would silently mis-attribute the
+    `down_proj` statistic on a model that packed up-first.
+
+    Sums are accumulated per-expert on-device (only ~130 MB across a 40x256 model) and moved to
+    CPU once in `importance()`; per-expert host syncs in the hook cost more than the statistic.
+    `granularity` is a read-time argument, so one calibration pass serves both arms.
+    """
+
+    def __init__(self, model: nn.Module, num_experts: int):
+        self.model = model
+        self.num_experts = num_experts
+        self.sumsq: dict[str, torch.Tensor] = {}
+        self.counts: dict[str, torch.Tensor] = {}
+        self.handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def add(self, key: str, expert: int, x: torch.Tensor) -> None:
+        """Fold x (n_tokens, d_in) into the running on-device sum for one expert."""
+        sq = x.detach().float().pow(2).sum(0)
+        if key not in self.sumsq:
+            self.sumsq[key] = torch.zeros(self.num_experts, sq.shape[0], device=sq.device)
+            self.counts[key] = torch.zeros(self.num_experts, device=sq.device)
+        self.sumsq[key][expert] += sq
+        self.counts[key][expert] += x.shape[0]
+
+    def make_hook(self, name: str) -> Callable[[nn.Module, tuple[torch.Tensor, ...]], None]:
+        layer = layer_index(name)
+        prefix = f"{layer}." if layer is not None else ""
+
+        def hook(module: nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+            hidden, top_k_index = args[0], args[1]
+            flat = hidden.reshape(-1, hidden.shape[-1])
+            # one host sync per layer for the expert list; everything else stays on device
+            for e in top_k_index.unique().tolist():
+                token_idx = (top_k_index == e).any(dim=-1).nonzero(as_tuple=True)[0]
+                x_e = flat[token_idx]
+                self.add(f"{prefix}gate_up_proj", e, x_e)
+                gate, up = nn.functional.linear(x_e, module.gate_up_proj[e]).chunk(2, dim=-1)
+                self.add(f"{prefix}down_proj", e, module.act_fn(gate) * up)
+        return hook
+
+    def __enter__(self) -> "ActivationImportanceProfiler":
+        for name, module in self.model.named_modules():
+            if type(module).__name__.endswith("Experts"):
+                self.handles.append(module.register_forward_pre_hook(self.make_hook(name)))
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+    def importance(self, granularity: str = "expert") -> dict[str, torch.Tensor]:
+        """Mean x^2 per key, on CPU: (n_experts, d_in) per expert, (d_in,) marginalized for a
+        layer. The layer statistic is the token-weighted marginal of the per-expert one, so the
+        two arms differ only in that marginalization."""
+        out: dict[str, torch.Tensor] = {}
+        for key, total in self.sumsq.items():
+            total, cnt = total.cpu(), self.counts[key].cpu()
+            out[key] = (total.sum(0) / cnt.sum().clamp(min=1.0) if granularity == "layer"
+                        else total / cnt.clamp(min=1.0).unsqueeze(1))
+        return out
+
+
+def normalize_importance(w: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    """Scale each importance vector to mean 1, optionally compressing its dynamic range first.
+    The weighted fit is invariant to the absolute scale, so this is about comparability across
+    experts; `alpha < 1` is the lever for when unmoderated magnitudes let a few hot channels
+    capture every centroid."""
+    if alpha != 1.0:
+        w = w.clamp(min=0).pow(alpha)
+    return w / w.mean(dim=-1, keepdim=True).clamp(min=1e-12)
+
+
+def shrink_importance(
+    raw: torch.Tensor, counts: torch.Tensor, layer_stat: torch.Tensor, tau: float = 1000.0,
+) -> torch.Tensor:
+    """Empirical-Bayes shrink per-expert E[x^2] (n_experts, d_in) toward the layer statistic
+    (d_in,) by routed-token count. At top-8 of 256 the tail experts see few tokens, so their raw
+    statistic is mostly noise; `tau` is the pseudo-count at which raw and layer contribute
+    equally, and a zero-token expert falls back exactly to the layer."""
+    n = counts.to(raw.dtype).unsqueeze(1)
+    return (n * raw + tau * layer_stat.to(raw.dtype).unsqueeze(0)) / (n + tau)
 
 
 def bits_from_frequency(

@@ -2,7 +2,9 @@ import pytest
 import torch
 from torch import nn
 
-from smart_quant.expert_importance import ExpertUsageProfiler, bits_from_frequency
+from smart_quant.expert_importance import (
+    ActivationImportanceProfiler, ExpertUsageProfiler, bits_from_frequency,
+    normalize_importance, shrink_importance)
 
 HIDDEN = 8
 NUM_EXPERTS = 16
@@ -81,6 +83,97 @@ class TestRouterSelection:
             model(torch.rand(TOKENS, HIDDEN))
         for freq in prof.frequencies().values():
             assert freq.sum() == pytest.approx(1.0, abs=1e-5)
+
+
+class TinyExperts(nn.Module):
+    """Mirrors the transformers-5 fused Experts contract the profiler hooks: fused
+    (num_experts, out, in) params and a forward taking the routing."""
+
+    def __init__(self, num_experts: int = 4, hidden: int = 8, inter: int = 4):
+        super().__init__()
+        self.num_experts = num_experts
+        self.hidden = hidden
+        self.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * inter, hidden) * 0.1)
+        self.down_proj = nn.Parameter(torch.randn(num_experts, hidden, inter) * 0.1)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        return torch.zeros_like(hidden_states)
+
+
+class TestShrinkImportance:
+    @pytest.mark.parametrize("counts,expect_raw", [([0.0, 5e3, 5e3], False), ([1e7, 1e7, 1e7], True)])
+    def test_shrinks_toward_layer_by_token_count(self, counts, expect_raw):
+        raw = torch.rand(3, 8) + 0.1
+        layer = torch.rand(8) + 0.1
+        w = shrink_importance(raw, torch.tensor(counts), layer, tau=1000.0)
+        target = raw[0] if expect_raw else layer
+        assert torch.allclose(w[0], target, atol=1e-3)
+
+    def test_normalize_scales_every_row_to_mean_one(self):
+        w = normalize_importance((torch.rand(4, 16) + 0.1) * 1e5)
+        assert torch.allclose(w.mean(dim=1), torch.ones(4), atol=1e-5)
+
+    def test_alpha_compresses_dynamic_range(self):
+        raw = torch.tensor([[1.0, 100.0, 10000.0]])
+        full, soft = normalize_importance(raw, alpha=1.0), normalize_importance(raw, alpha=0.5)
+        assert soft.max() / soft.min() < full.max() / full.min()
+
+
+class TestActivationImportance:
+    def test_attributes_per_routed_expert(self):
+        torch.manual_seed(0)
+        experts = TinyExperts()
+        idx = torch.tensor([[0, 1]] * 6 + [[2, 3]] * 4)
+        with ActivationImportanceProfiler(experts, num_experts=4) as prof:
+            experts(torch.randn(10, 8), idx, torch.ones(10, 2))
+        assert prof.counts["gate_up_proj"].tolist() == [6.0, 6.0, 4.0, 4.0]
+        assert prof.importance()["gate_up_proj"].shape == (4, 8)
+
+    def test_down_proj_statistic_matches_hand_computed_intermediate(self):
+        torch.manual_seed(1)
+        experts = TinyExperts()
+        x = torch.randn(5, 8)
+        with ActivationImportanceProfiler(experts, num_experts=4) as prof:
+            experts(x, torch.zeros(5, 1, dtype=torch.long), torch.ones(5, 1))
+        gate, up = nn.functional.linear(x, experts.gate_up_proj[0]).chunk(2, dim=-1)
+        expected = (experts.act_fn(gate) * up).pow(2).mean(0)
+        assert torch.allclose(prof.importance()["down_proj"][0], expected, atol=1e-5)
+
+    def test_layer_granularity_marginalizes_the_same_pass(self):
+        # one calibration pass serves both arms; layer is the token-weighted marginal of expert
+        torch.manual_seed(2)
+        experts = TinyExperts()
+        x = torch.randn(6, 8)
+        with ActivationImportanceProfiler(experts, num_experts=4) as prof:
+            experts(x, torch.tensor([[0, 1]] * 6), torch.ones(6, 2))
+        assert prof.importance("expert")["gate_up_proj"].shape == (4, 8)
+        stat = prof.importance("layer")["gate_up_proj"]
+        assert stat.shape == (8,)
+        assert torch.allclose(stat, x.pow(2).mean(0), atol=1e-5)
+
+    def test_keys_are_layer_indexed_not_module_paths(self):
+        # the artifact must survive AutoModel vs AutoModelForCausalLM prefix differences
+        torch.manual_seed(3)
+
+        class Wrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([nn.Module()])
+                self.layers[0].mlp = nn.Module()
+                self.layers[0].mlp.experts = TinyExperts()
+
+        w = Wrapper()
+        with ActivationImportanceProfiler(w, num_experts=4) as prof:
+            w.layers[0].mlp.experts(torch.randn(4, 8), torch.zeros(4, 1, dtype=torch.long),
+                                    torch.ones(4, 1))
+        assert sorted(prof.importance()) == ["0.down_proj", "0.gate_up_proj"]
+
+    def test_hooks_removed_on_exit(self):
+        experts = TinyExperts()
+        with ActivationImportanceProfiler(experts, num_experts=4) as prof:
+            pass
+        assert prof.handles == [] and not experts._forward_pre_hooks
 
 
 class TestBitAllocation:
