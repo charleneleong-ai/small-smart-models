@@ -1,7 +1,7 @@
 # Phase 7 — activation-weighted first-order PQ
 
 **Study:** bits-per-brain · **Branch:** `feat/weighted-pq-phase7` (off `main`, PRs #6 + #7 merged)
-**Date:** 2026-07-29 · **Status:** design approved, pending spec review
+**Date:** 2026-07-29 · **Status:** design approved; mechanism revised 2026-07-29 after box recon
 
 ## Problem
 
@@ -28,88 +28,93 @@ vptq plumbing risk and Phase 6a's granularity floor. Phase 6b stays deferred, no
 
 ## The layout fact this design turns on
 
-[`quantize_fused_experts`](../../src/smart_quant/encode.py) slices a fused `(num_experts, d_in, d_out)`
-tensor and does `out, in_ = weight[e].shape` — so what PQ calls `in_` is really **d_out**. Sub-vectors
-run along the *output* dim.
+Confirmed on the box — see [recon findings](../plans/2026-07-29-phase7-recon-findings.md). Fused expert
+weights are `(num_experts, out_features, in_features)`, the standard `nn.Linear` layout, because the
+forward uses `F.linear(x, W)` = `x @ W.T`:
 
-Importance `E[x_j²]` is per *input* channel, which is axis 0 — the row index. Every element of a
-sub-vector therefore shares one scalar weight. This is what makes the design cheap: the weighting is
-per-sample, not per-dimension, so it needs no change to the distance metric and no change to
-[`pq_dequantize`](../../src/smart_quant/codebook.py).
-
-It also rules out the pre-scaling alternative (scale rows by `√w`, quantize, unscale). That is exact for
-the same objective, but it gives row `i` a codebook scaled by `1/√w_i` — a free per-row scale factor on
-top of the weighting. A win could not be attributed to weighting rather than rescaling, and the scale
-vector would need storing and accounting in `pq_bpw`. Weighted Lloyd's has neither problem.
-
-## Design
-
-### 1. `lloyd_kmeans` — optional `sample_weight`
-
-```python
-def lloyd_kmeans(x, k, iters=10, sample_weight=None) -> tuple[torch.Tensor, torch.Tensor]:
+```
+gate_up_proj (256, 1024, 2048)     # out = 2 x moe_inter, in = hidden
+down_proj    (256, 2048, 512)      # out = hidden,        in = moe_inter
 ```
 
-Assignment is unchanged — nearest centroid is nearest regardless of weight. Only the centroid update is
-weighted: `index_add_` accumulates `w.unsqueeze(1) * x` against `w` instead of `x` against ones. Weights
-are normalized to mean 1 on entry. `sample_weight=None` takes the existing code path untouched.
+So `out, in_ = weight[e].shape` in [`quantize_fused_experts`](../../src/smart_quant/encode.py) is
+correctly named, and `pq_quantize` splits `in_` into `sub_dim`-wide groups — **sub-vectors run along the
+input dim**. Importance `E[x_j²]` is per input channel, so the four elements of a sub-vector carry four
+*different* weights. The weighting is per-dimension, not per-sample.
 
-### 2. `pq_quantize` — thread the weight through
+(The `encode.py` module docstring claims `(num_experts, d_in, d_out)`. That is wrong and is fixed in
+this phase.)
 
-Gains `sample_weight: torch.Tensor | None` of length `out` (one per input channel), broadcast across
-that row's `groups` sub-vectors to match the flattened `pool`. The `max_fit` strided subsample must be
-applied to the weights with the *same* index tensor used for the points — misalignment here corrupts the
-fit silently, so it is a named test case rather than an assumed invariant.
+## Design — pre-scaling
 
-The `share_codebook=False` path takes the same weights per row; no separate handling.
+Per-dimension weighting is applied by change of variables rather than by rewriting the distance metric.
+Scale each input channel by `√w_j` before quantizing, fit in the scaled space, and divide back out on
+reconstruction. Because
 
-### 3. `residual_pq_quantize` — forward the weight
+```
+Σ_d (√w_d·x_d − √w_d·c_d)²  ≡  Σ_d w_d(x_d − c_d)²
+```
 
-It sits in the call chain (`quantize_fused_experts` → `residual_pq_quantize` → `pq_quantize`) even at
-`codebook_order=1`, where it runs a single stage, so it must accept `sample_weight` and pass it through.
-Weights apply unchanged at every stage: the residual `weight − Σ recon` has the same rows, so the same
-per-input-channel importance holds. This costs one parameter and makes weighting compose with Phase 6a's
-residual path for free, though no Phase-7 encode uses `order > 1`.
+plain k-means on the scaled weights **exactly** minimizes the weighted objective. Pooling scaled
+sub-vectors from all groups into one shared codebook still minimizes the true global weighted error —
+the substitution is per-element, so the pooled sum is the weighted sum.
 
-### 4. `pq_bpw` — unchanged
+The alternative — collapsing each sub-vector's four weights to their mean and running weighted k-means —
+is an approximation of the same objective for no gain in simplicity, and is out of scope.
 
-Weighting moves centroids. It does not change `k`, index count, or codebook size, so realized bpw is
-identical to the unweighted encode. This is asserted, not assumed (see Testing).
+### Where it lives
+
+Entirely in [`quantize_fused_experts`](../../src/smart_quant/encode.py).
+[`lloyd_kmeans`](../../src/smart_quant/codebook.py),
+[`pq_quantize`](../../src/smart_quant/codebook.py) and
+[`pq_dequantize`](../../src/smart_quant/codebook.py) are **untouched**:
+
+```python
+w_sqrt = importance[e].sqrt()                                   # (in_features,)
+codes, cbs = residual_pq_quantize(weight[e] * w_sqrt, ...)      # fit in scaled space
+weight[e] = (pq_dequantize(codes, cbs) / w_sqrt).to(weight.dtype)
+```
+
+### `pq_bpw` — scale storage
+
+The scale vector must be reconstructable at inference, so it is stored and counted. `pq_bpw` gains an
+optional `scale_len: int | None = None` term adding `scale_len * 16` bits:
+
+| tensor | `w` length | added bpw (per-expert) | added bpw (per-layer) |
+|---|---|---|---|
+| `gate_up_proj` | 2048 | 2048·16 / (1024·2048) = **0.0156** | /256 → 0.00006 |
+| `down_proj` | 512 | 512·16 / (2048·512) = **0.0078** | /256 → 0.00003 |
 
 ### Matched-footprint discipline
 
-Because `pq_bpw` is invariant, the comparison is matched **by construction** rather than by tuning:
-`wpq20-expert` lands at the same realized `expert_bpw` as `pq2-uniform` (2.00) and `wpq25-expert` at the
-same as `pq25-uniform` (2.542). No budget search, and no repeat of the Phase-6a granularity floor that
-forced `rvq26` to be relabelled `rvq25`.
+Weighting does not change `k`, index count, or codebook size — only where centroids land — so the only
+footprint delta is the scale vector above. Realized `expert_bpw` for the per-expert arm lands ~0.012
+higher than its unweighted pair (≈2.012 against `pq2-uniform`'s 2.000). **This is reported honestly
+rather than tuned away**: shrinking `k` to force a digit-exact match would handicap the arm under test
+with fewer centroids, which is a worse distortion than a 0.6% footprint difference stated plainly. The
+per-layer arm is matched to within 0.0001 and needs no caveat.
 
 ## Calibration
 
-Two projections need two statistics:
+Both projections get real statistics — recon verdict **FULL**. The `Experts.forward` signature is
 
-| tensor | `weight[e]` shape | input whose `E[x²]` is needed | reachable |
-|---|---|---|---|
-| `gate_up_proj` | (hidden, 2·inter) | hidden states entering the MoE block | yes — `Experts` forward-pre hook |
-| `down_proj` | (inter, hidden) | post-activation intermediate | not directly — internal to the fused forward |
+```
+forward(hidden_states: Tensor, top_k_index: Tensor, top_k_weights: Tensor) -> Tensor
+```
 
-**Step 0 of implementation is inspecting the real `Experts` module tree and forward signature on
-`pi-a100-80gb`.** `transformers` is deliberately absent from the local/CI surface (`pyproject.toml`
-keeps it torch-only), so the hook design below is provisional until verified against the model.
+so a single `forward_pre_hook` receives the hidden states **and** the routing. There is no router hook,
+no pairing by layer, and no hook-ordering hazard. `hidden_states` arrives already flattened to
+`(tokens, hidden)`; `top_k_index` is `(tokens, top_k)`.
 
-`ActivationImportanceProfiler` in [`expert_importance.py`](../../src/smart_quant/expert_importance.py)
-mirrors [`ExpertUsageProfiler`](../../src/smart_quant/expert_importance.py) and **reuses its router
-predicate** — that `mlp.gate` name-matching is the one piece already proven to survive the transformers-5
-`Qwen3MoeTopKRouter` refactor, and is where a fresh implementation would break the same way.
+`ActivationImportanceProfiler` in [`expert_importance.py`](../../src/smart_quant/expert_importance.py):
 
-- Hooks the router (per-token expert indices) and the `Experts` module (input hidden states), paired by
-  [`layer_index`](../../src/smart_quant/encode.py).
-- Accumulates `Σx²` and a token count per (layer, expert). Never retains raw activations, so the
-  statistic is bounded at `n_layers × n_experts × d_in` floats (40 × 256 × d_in), held on CPU —
-  a few hundred MB at most for the per-expert case, negligible for per-layer.
-- `down_proj`: recomputes the intermediate inside the hook from captured input and the still-fp16
-  weights (one extra half-FFN matmul over calibration tokens).
-  **Fallback if the fused gate/up packing cannot be split cleanly: weight `gate_up_proj` only and hold
-  `down_proj` uniform, recorded as a stated limitation of the phase.**
+- Hooks each `Experts` module, accumulating `Σx²` and a token count per (tensor, expert).
+- `gate_up_proj`: statistic is over `hidden_states` directly.
+- `down_proj`: the intermediate is recomputed inside the hook from the captured input, using the same
+  packing the forward uses — `gate, up = F.linear(x_e, gate_up_proj[e]).chunk(2, -1)`, then
+  `act_fn(gate) * up`.
+- Retains only running sums, never raw activations, so memory is bounded at
+  `n_layers × n_experts × d_in` floats held on CPU.
 - Caches to `expert_act_importance.pt` beside the existing `expert_freq.pt` (untracked box cache).
 
 ### Cold-expert shrinkage
@@ -122,7 +127,8 @@ statistic by token count:
 w_e = (n_e · w_e_raw + τ · w_layer) / (n_e + τ)      # τ = pseudo-count, default 1000 tokens
 ```
 
-A zero-token expert resolves exactly to `w_layer`. Each `w` is then normalized to mean 1.
+A zero-token expert resolves exactly to `w_layer`. Each `w` is then normalized to mean 1, which also
+keeps `√w` near unity so the scaled weights stay in a sane numeric range.
 
 `α` (applying `w^α`) is exposed but defaults to `1.0`. Unmoderated activation magnitudes span orders of
 magnitude and can make k-means degenerate, with a few hot rows capturing every centroid; `α<1` is the
@@ -131,17 +137,18 @@ is clean.
 
 ## Wiring
 
-- [`encode.py`](../../src/smart_quant/encode.py) — thread `sample_weight` per expert through
-  `quantize_fused_experts` into `residual_pq_quantize`. Absent weights take the existing path, so
-  Phase-5/6 encodes stay byte-identical.
-- [`cli.py`](../../src/smart_quant/cli.py) — `--importance-weights PATH` and
-  `--importance-granularity {expert,layer}` on `encode-eval`, both off by default. Labels follow
-  `wpq<bpw>-<granularity>`; the three the experiment actually runs are listed below.
+- [`encode.py`](../../src/smart_quant/encode.py) — `quantize_fused_experts` gains `sample_weight`
+  (`(in_,)` shared or `(num_experts, in_)` per expert) and does the scale/unscale; `quantize_experts`
+  gains `importance: dict[str, torch.Tensor] | None` keyed by full fused parameter name, since
+  `gate_up_proj` and `down_proj` have different `in_features`. Absent weights take the existing path,
+  so Phase-5/6 encodes stay byte-identical.
+- [`cli.py`](../../src/smart_quant/cli.py) — `--importance-path` and `--importance-granularity` on
+  `encode-eval`, plus a `profile-activations` command. Labels are `wpq<bpw>-<granularity>`.
 
 ## Experiment
 
 Three sequential encodes on `pi-a100-80gb` (only one fp16 model fits at a time), as detached PPID=1
-daemons, plus one forward-only calibration pass:
+daemons, plus two forward-only calibration passes:
 
 | label | granularity | target | pairs against | reference ppl |
 |---|---|---|---|---|
@@ -167,21 +174,20 @@ every form of non-uniform allocation tried against it and uniform first-order PQ
 
 ## Testing
 
-New cases in [`tests/test_codebook.py`](../../tests/test_codebook.py),
-[`tests/test_encode.py`](../../tests/test_encode.py), and
+New cases in [`tests/test_encode.py`](../../tests/test_encode.py),
+[`tests/test_codebook.py`](../../tests/test_codebook.py), and
 [`tests/test_expert_importance.py`](../../tests/test_expert_importance.py), by area:
 
-- **Order-1 regression safety** — `sample_weight=None` and all-ones weights are both `torch.equal`
-  to today's `lloyd_kmeans` output (centroids and assignment). All-ones additionally catches
-  normalization bugs that `None` would skip.
-- **Weighting has the intended effect** — two separated clusters, one weighted 10×; the fitted centroid
-  shifts measurably toward it.
-- **`max_fit` weight alignment** — constructed so a misaligned subsample yields a detectably wrong
-  centroid. This is the silent-corruption path.
-- **Footprint invariance** — `pq_bpw` identical with and without weights; `quantize_fused_experts`
-  realized bpw matches the unweighted encode at the same `k`.
+- **Regression safety** — `sample_weight=None` leaves `quantize_fused_experts` byte-identical to today.
+- **Weighting has the intended effect** — heavily-weighted input channels reconstruct measurably better
+  than under the unweighted fit, and unweighted channels correspondingly worse.
+- **Exactness of the change of variables** — on a small case, the scaled-space fit achieves lower
+  *weighted* error than the unweighted fit, confirming the objective actually being minimized.
+- **`pq_bpw` scale term** — `scale_len` adds exactly `scale_len·16` bits and matches the table above.
 - **Shrinkage** — zero-token expert resolves exactly to the layer statistic; high-count expert
-  approaches its raw statistic.
+  approaches its raw statistic; every row normalized to mean 1.
+- **Profiler** — attributes per routed expert from `top_k_index`, and the `down_proj` recompute matches
+  a hand-computed `act_fn(gate)*up` on a tiny fixture.
 
 ## Plot & doc
 
@@ -195,13 +201,13 @@ New cases in [`tests/test_codebook.py`](../../tests/test_codebook.py),
 
 ## PR plan
 
-One PR, `feat/weighted-pq-phase7`, off `main`. Calibration profiler + weighted quantizer + wiring +
-tests + encodes + plot + doc.
+One PR, `feat/weighted-pq-phase7`, off `main`. Calibration profiler + scaled-space quantization +
+wiring + tests + encodes + plot + doc.
 
 ## Out of scope
 
-- **Pre-scaling (per-row `√w`) variant** — a strict superset of this design and the natural follow-up if
-  weighting shows signal, but confounded as a first test.
+- **Per-sub-vector scalar weighting** — an approximation of the same objective; only interesting if the
+  scale-vector storage ever becomes a real constraint, which at 0.0156 bpw it is not.
 - **Phase 6b vptq spike** — still deferred, not cancelled.
 - **AQLM joint beam-search** — unchanged from Phase 6a.
-- **`.pre-commit-config.yaml` ruff C901/PLR0915 gate** — repo-wide follow-up tracked separately.
+- **`.pre-commit-config.yaml` ruff C901/PLR0915 gate** — repo-wide follow-up.
