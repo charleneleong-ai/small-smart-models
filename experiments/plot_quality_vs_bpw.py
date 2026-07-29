@@ -42,7 +42,7 @@ class Family:
 # by exclusion rather than by prefix — adding a family means adding a row here and nothing else.
 FAMILIES = (
     Family("rvq", "#7c3aed", "#5b21b6", "residual codebook PQ (2-stage)", (6, -14)),
-    Family("wpq", "#0d9488", "#115e59", "activation-weighted PQ", (6, 7)),
+    Family("wpq", "#0d9488", "#115e59", "activation-weighted PQ", (-9, 5)),
 )
 
 
@@ -78,8 +78,11 @@ def draw_curve(ax, pts: list[tuple[float, float, str]], color: str, annot_color:
     xs, ys, _ = zip(*pts)
     ax.plot(xs, ys, "o-", color=color, lw=2, ms=7, label=legend, zorder=3)
     for x, y, name in pts:
+        # a negative x offset means "label to the left", so anchor the text's right edge —
+        # families sharing a footprint must lean opposite ways or their labels stack
         ax.annotate(name.replace(strip, ""), (x, y), textcoords="offset points",
-                    xytext=offset, fontsize=8, color=annot_color)
+                    xytext=offset, fontsize=8, color=annot_color,
+                    ha="right" if offset[0] < 0 else "left")
 
 
 def render(rows: list[dict[str, Any]], out: Path) -> dict[str, float]:
@@ -103,9 +106,11 @@ def render(rows: list[dict[str, Any]], out: Path) -> dict[str, float]:
             label=f"PQ @ {IMATRIX_BPW} bpw (interp. {pq_at_imatrix:.2f})", zorder=4)
 
     gap_pct = (imatrix_ppl - pq_at_imatrix) / fp16 * 100
+    # placed above the imatrix marker: the 2.5-2.6 band is crowded with same-footprint points
+    # (pq25 and both wpq25 arms all sit at 2.542), so an offset to the right overlaps them
     ax.annotate(f"matched footprint\nPQ beats imatrix\nby {gap_pct:.1f} pp degradation",
-                (IMATRIX_BPW, (imatrix_ppl + pq_at_imatrix) / 2),
-                textcoords="offset points", xytext=(14, -4), fontsize=8.5, color="#065f46")
+                (IMATRIX_BPW, imatrix_ppl), textcoords="offset points", xytext=(10, 26),
+                fontsize=8.5, color="#065f46", ha="left")
 
     ax.set_xlabel("expert bits-per-weight (realized)")
     ax.set_ylabel("wikitext-2 perplexity  (lower = better)")
