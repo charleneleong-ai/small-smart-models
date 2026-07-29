@@ -1,7 +1,9 @@
 import pytest
 import torch
 
-from smart_quant.codebook import pq_bpw, pq_dequantize, pq_quantize, residual_pq_quantize
+from conftest import heavy_channels, heterogeneous, weighted_mse
+from smart_quant.codebook import (
+    lloyd_kmeans, pq_bpw, pq_dequantize, pq_quantize, residual_pq_quantize)
 
 
 class TestProductQuantization:
@@ -60,6 +62,74 @@ class TestBpw:
 
     def test_int_and_list_agree(self):
         assert pq_bpw(2048, 512, 4, 256) == pq_bpw(2048, 512, 4, [256])
+
+
+class TestWeightedKMeans:
+    def test_uniform_weight_agrees_with_unweighted(self):
+        # an explicit all-ones vector, not None — None is the default, so comparing against it
+        # would assert f(x) == f(x). This exercises the weighted branch itself.
+        torch.manual_seed(1)
+        x = torch.randn(512, 4)
+        plain = lloyd_kmeans(x, 16, iters=8)[0]
+        uniform = lloyd_kmeans(x, 16, iters=8, dim_weight=torch.ones(512, 4))[0]
+        assert torch.allclose(plain, uniform, atol=1e-5)
+
+    @pytest.mark.parametrize("weight,dims", [([2.7, 0.4, 5.1, 0.9], slice(None)),
+                                             ([100.0, 1.0, 1.0, 1.0], slice(0, 1))])
+    def test_lowers_the_weighted_error_it_optimizes(self, weight, dims):
+        # weighted k-means searches the same centroid family as the unweighted fit but scores it
+        # by the weighted objective, so it cannot do worse on that objective — globally, or on
+        # the one dimension a lopsided weight favours
+        torch.manual_seed(2)
+        x = torch.randn(2048, 4)
+        w = torch.tensor(weight).expand(2048, 4)
+        cu, iu = lloyd_kmeans(x, 64, iters=15)
+        cw, iw = lloyd_kmeans(x, 64, iters=15, dim_weight=w)
+        assert (weighted_mse(cw[iw][:, dims], x[:, dims], w[:, dims])
+                < weighted_mse(cu[iu][:, dims], x[:, dims], w[:, dims]))
+
+
+class TestWeightedProductQuantization:
+    def test_weighted_channels_reconstruct_better(self):
+        torch.manual_seed(5)
+        w = heterogeneous(256, 32)
+        cw = heavy_channels(32)
+        plain = pq_dequantize(*pq_quantize(w, 4, 16, iters=15))
+        weighted = pq_dequantize(*pq_quantize(w, 4, 16, iters=15, channel_weight=cw))
+        assert ((weighted[:, :8] - w[:, :8]).pow(2).mean()
+                < (plain[:, :8] - w[:, :8]).pow(2).mean())
+
+    def test_max_fit_keeps_weights_aligned_to_points(self):
+        # Reversing the weights is the misalignment control: if the subsample paired weights
+        # with the wrong points, the true and reversed vectors would be equally (un)helpful.
+        torch.manual_seed(6)
+        w = heterogeneous(512, 64)
+        cw = torch.rand(64) * 10 + 0.1
+
+        def fit(c):
+            return pq_dequantize(*pq_quantize(w, 4, 32, iters=15, max_fit=1024, channel_weight=c))
+
+        weighted, reversed_ = fit(cw), fit(cw.flip(0))
+        plain = pq_dequantize(*pq_quantize(w, 4, 32, iters=15, max_fit=1024))
+        assert weighted_mse(weighted, w, cw) < weighted_mse(plain, w, cw)
+        assert weighted_mse(weighted, w, cw) < weighted_mse(reversed_, w, cw)
+
+    def test_pergroup_path_accepts_weights(self):
+        torch.manual_seed(7)
+        w = heterogeneous(64, 32)
+        codes, cb = pq_quantize(w, 8, 16, share_codebook=False,
+                                channel_weight=torch.rand(32) + 0.1)
+        assert codes.shape == (64, 4) and cb.shape == (4, 16, 8)
+
+    def test_residual_weights_every_stage_not_just_the_first(self):
+        # a weight forwarded to stage 0 only would match the 1-stage result; reaching stage 1
+        # must improve on it
+        torch.manual_seed(8)
+        w = heterogeneous(256, 32)
+        cw = heavy_channels(32)
+        one = pq_dequantize(*residual_pq_quantize(w, 4, [16], channel_weight=cw))
+        two = pq_dequantize(*residual_pq_quantize(w, 4, [16, 16], channel_weight=cw))
+        assert weighted_mse(two, w, cw) < weighted_mse(one, w, cw)
 
 
 class TestResidualQuantization:
