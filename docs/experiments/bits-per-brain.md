@@ -187,6 +187,39 @@ Nuance vs phase 3: imatrix's *dynamic* (importance-driven) allocation **helps** 
 *expert-aware* codebook allocation **hurt** — coarse per-expert bit reallocation hits the
 codebook's convexity penalty, whereas imatrix's fine-grained per-weight importance does not.
 
+### Phase 5 — equal-footprint comparison (the verdict flips)
+
+Phase 4 compared imatrix at ~2.6 bpw against PQ at 2.0 — imatrix had **30% more bits**, so
+"imatrix wins" conflated method with footprint. Phase 5 sweeps uniform PQ across the imatrix
+budget (realized `expert_bpw` now measured per encode, [`smart_quant.encode.quantize_fused_experts`](../../src/smart_quant/encode.py))
+and reads off the curve at the imatrix footprint. Every point is experts-only bpw; the imatrix
+ppl is placed on the transformers axis by its own +7.8% degradation applied to the fp16 ceiling
+(5.92 × 1.078 = 6.38) — the same delta-normalization as phase 4.
+
+| method | expert bpw | ppl | Δ vs fp16 |
+|---|---|---|---|
+| PQ pq175-uniform | 1.76 | 7.33 | +23.9% |
+| PQ pq2-uniform | 2.0 | 6.77 | +14.3% |
+| PQ pq25-uniform | 2.54 | 6.21 | +5.0% |
+| **PQ @ 2.6 (interp.)** | **2.6** | **6.19** | **+4.6%** |
+| imatrix UD-IQ2_M | ~2.6 | 6.38 | +7.8% |
+| PQ pq275-uniform | 2.83 | 6.11 | +3.2% |
+
+**At matched ~2.6 bpw, uniform PQ beats imatrix — +4.6% vs +7.8% degradation, a 3.2 pp margin.**
+The phase-4 ranking was a footprint artifact: hold bits equal and the from-scratch k-means
+codebook edges out Unsloth's importance-matrix scalar quant. The curve is steep below 2 bpw
+(pq175 at +23.9% is where the codebook starts to break down) and flattens above 2.5, so the two
+methods are only genuinely comparable in the 2.5–2.8 band — which is exactly where the crossover
+sits.
+
+![quality vs bpw](../../experiments/progress/bits-per-brain/quality-vs-bpw.png)
+
+This flips phase 4's "beating imatrix needs a sophisticated codebook" caveat: even a *naive* PQ
+clears it once the footprint is matched. Same honest caveats carry over — fake-quant, perplexity,
+one dataset — and the imatrix point is a single normalized measurement, not a swept curve, so the
+3.2 pp margin is indicative rather than a tight CI. A second-order codebook (VPTQ/AQLM) would only
+widen it.
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)
@@ -201,10 +234,12 @@ codebook's convexity penalty, whereas imatrix's fine-grained per-weight importan
    branch with no `qwen3_5_moe` support, and this arch has blocked every quant path (GGUF,
    AWQ) — a weight-level PQ is arch-agnostic and more instructive. *Finding:* per-group
    fp16 codebooks are overhead-heavy (~4 bpw on 2048×512 experts, since codebook storage
-   ≈ index storage at that size); reaching ~2 bpw needs **codebook sharing across
-   groups/experts** — the next increment, and where importance-aware sharing re-enters.
-4. **Measure** — same harness; footprint-matched comparison table + quality-vs-bpw plot.
-5. **Write up** — `docs/experiments/vptq-vs-imatrix.md`, W&B run group `ssm-vptq`.
+   ≈ index storage at that size); reaching ~2 bpw needed **codebook sharing across
+   groups/experts**, now the default (`share_codebook=True`) and where importance-aware
+   sharing re-enters.
+4. **Measure** — same harness; footprint-matched comparison table + quality-vs-bpw plot
+   (phase 5 above).
+5. **Write up** — this doc, W&B run group `ssm-bits-per-brain`.
 
 ## Hardware & budget
 

@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 quant = ["vptq>=0.0.5", "aqlm>=1.1"]
+viz = ["matplotlib>=3.9"]  # experiments/plot_quality_vs_bpw.py
 
 # CI test surface. The unit suite exercises the pure-torch core
 # (footprint/codebook/encode/expert_importance) only; transformers/datasets and the
