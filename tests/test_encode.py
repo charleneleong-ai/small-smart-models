@@ -1,7 +1,10 @@
+import copy
 import pytest
 import torch
 
-from smart_quant.encode import centroids_for_bits, quantize_fused_experts
+from conftest import TinyExperts, heavy_channels, heterogeneous, weighted_mse, wrap_in_layers
+from smart_quant.encode import centroids_for_bits, quantize_experts, quantize_fused_experts
+from smart_quant.expert_importance import ActivationImportanceProfiler
 
 
 class TestCentroidsForBits:
@@ -45,6 +48,84 @@ class TestQuantizeFusedExperts:
                                            iters=5, codebook_order=2)
         assert bits2 / n2 == pytest.approx(bits1 / n1, abs=0.15)   # matched footprint
         assert (w2 - base).norm() < base.norm()                    # a reconstruction
+
+
+def encode(weight: torch.Tensor, bits: float, channel_weight: torch.Tensor | None = None):
+    return quantize_fused_experts(weight, torch.full((weight.shape[0],), bits), sub_dim=4,
+                                  iters=15, channel_weight=channel_weight)
+
+
+class TestWeightedFusedExperts:
+    def test_footprint_is_unchanged_by_weighting(self):
+        # the matched-comparison guarantee: weights move centroids, never bit counts
+        torch.manual_seed(3)
+        w = heterogeneous(2, 64, 128)
+        plain = encode(w.clone(), 2.0)
+        weighted = encode(w.clone(), 2.0, torch.rand(2, 128) + 0.1)
+        assert plain == weighted
+
+    @pytest.mark.parametrize("region", [slice(0, 16), slice(None)])
+    def test_weighting_improves_the_channels_it_favours(self, region):
+        # slice(0,16): the heavy channels reconstruct better. slice(None): the global weighted
+        # objective falls — the property the fit actually optimizes.
+        torch.manual_seed(1)
+        base = heterogeneous(1, 64, 128)
+        cw = heavy_channels(128, n_heavy=16)
+        plain, weighted = base.clone(), base.clone()
+        encode(plain, 1.5)
+        encode(weighted, 1.5, cw.expand(1, -1))
+        scale = 1.0 if region == slice(0, 16) else cw
+        assert (weighted_mse(weighted[0, :, region], base[0, :, region], scale)
+                < weighted_mse(plain[0, :, region], base[0, :, region], scale))
+
+    def test_per_expert_weights_favour_each_expert_separately(self):
+        # exercises the (num_experts, in_) path: expert 0 favours the low channels, expert 1 the
+        # high ones, so neither can be explained by a shared codebook accident
+        torch.manual_seed(4)
+        base = heterogeneous(2, 64, 128)
+        cw = torch.stack([heavy_channels(128, 16), heavy_channels(128, 16).flip(0)])
+        plain, weighted = base.clone(), base.clone()
+        encode(plain, 1.5)
+        encode(weighted, 1.5, cw)
+        def err(t, e, sl):
+            return (t[e, :, sl] - base[e, :, sl]).pow(2).mean()
+
+        assert err(weighted, 0, slice(0, 16)) < err(plain, 0, slice(0, 16))
+        assert err(weighted, 1, slice(-16, None)) < err(plain, 1, slice(-16, None))
+
+
+class TestImportanceKeyContract:
+    """The profiler and the encode load the model through different wrappers; keys must bridge."""
+
+    def test_profiler_keys_match_what_quantize_experts_looks_up(self):
+        # Producer nests one level deep (AutoModel), consumer two (AutoModelForCausalLM). Keying
+        # by module path would miss every tensor and silently run unweighted.
+        torch.manual_seed(0)
+        producer = wrap_in_layers(TinyExperts(), prefix_depth=1)
+        with ActivationImportanceProfiler(producer, num_experts=4) as prof:
+            producer.inner.layers[0].mlp.experts(
+                torch.randn(8, 8), torch.zeros(8, 1, dtype=torch.long), torch.ones(8, 1))
+        importance = prof.importance("expert")
+
+        # Compare weighted against unweighted rather than against the original: quantization
+        # happens either way, so "weights changed" would pass even with the keys never matching.
+        torch.manual_seed(2)
+        base = TinyExperts()
+        weighted = wrap_in_layers(copy.deepcopy(base), prefix_depth=2)
+        plain = wrap_in_layers(copy.deepcopy(base), prefix_depth=2)
+        assert quantize_experts(weighted, avg_bits=2.0, iters=3, importance=importance)
+        quantize_experts(plain, avg_bits=2.0, iters=3)
+        assert not torch.equal(weighted.inner.inner.layers[0].mlp.experts.gate_up_proj,
+                               plain.inner.inner.layers[0].mlp.experts.gate_up_proj), \
+            "importance was looked up but never reached the fit"
+
+    def test_unmatched_importance_raises_instead_of_degrading(self):
+        # a silent fallback here would publish a null result caused by plumbing
+        torch.manual_seed(1)
+        consumer = wrap_in_layers(TinyExperts(), prefix_depth=1)
+        with pytest.raises(KeyError, match="no key matched"):
+            quantize_experts(consumer, avg_bits=2.0, iters=3,
+                             importance={"model.layers.0.mlp.experts.gate_up_proj": torch.ones(8)})
 
 
 class TestRealizedBpw:
