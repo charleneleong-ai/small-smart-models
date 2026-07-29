@@ -4,7 +4,7 @@
 
 **Goal:** Add activation-derived importance weighting to the first-order product quantizer and measure whether it beats uniform PQ at matched footprint.
 
-**Architecture:** Weighting is applied by change of variables — scale each input channel by `√w`, fit the codebook in the scaled space, divide back out on reconstruction. This exactly minimizes the weighted objective while leaving `lloyd_kmeans`, `pq_quantize` and `pq_dequantize` untouched; all of it lives in `quantize_fused_experts`. The one footprint cost is storing `w`, counted honestly by a new `scale_len` term on `pq_bpw`.
+**Architecture:** Sub-vectors run along the input dim, so a sub-vector's coordinates carry different importances. The codebook fit minimizes the per-dimension weighted objective directly — weighted assignment and weighted centroid update, expanded into three matmuls costing the same as the `cdist` they replace. Weights steer the fit only; reconstruction stays a plain codebook lookup, so nothing extra is stored and a weighted encode is footprint-identical to its unweighted pair.
 
 **Tech Stack:** Python 3.13, PyTorch (CPU for unit tests, CUDA on the box), typer CLI, pytest, matplotlib.
 
@@ -38,274 +38,33 @@ Committed as `55db620`. Verdict **FULL**: both projections get real statistics.
 
 ---
 
-### Task 2: `pq_bpw` scale-vector term
+### ~~Task 2: `pq_bpw` scale-vector term~~ — DROPPED
 
-**Files:**
-- Modify: `src/smart_quant/codebook.py:115-127`
-- Test: `tests/test_codebook.py`
-
-**Interfaces:**
-- Consumes: nothing.
-- Produces: `pq_bpw(out: int, in_: int, sub_dim: int, n_centroids: int | list[int], share_codebook: bool = True, scale_len: int | None = None) -> float`. `scale_len` is the number of fp16 scale values stored alongside the codes; `None` reproduces today's result exactly.
-
-- [ ] **Step 1: Write the failing tests**
-
-Add to `tests/test_codebook.py`, inside the existing `TestBpw` class:
-
-```python
-    def test_scale_len_none_matches_today(self):
-        assert pq_bpw(1024, 2048, 4, 256, scale_len=None) == pq_bpw(1024, 2048, 4, 256)
-
-    @pytest.mark.parametrize("out,in_,expected", [(1024, 2048, 0.015625), (2048, 512, 0.0078125)])
-    def test_scale_term_matches_hand_computed_overhead(self, out, in_, expected):
-        # w is one fp16 per input channel: in_ * 16 bits over out * in_ weights
-        plain = pq_bpw(out, in_, 4, 256)
-        scaled = pq_bpw(out, in_, 4, 256, scale_len=in_)
-        assert scaled - plain == pytest.approx(expected, rel=1e-9)
-```
-
-- [ ] **Step 2: Run to verify they fail**
-
-Run: `PYTHONPATH=src .venv/bin/python -m pytest tests/test_codebook.py::TestBpw -v`
-Expected: FAIL — `TypeError: pq_bpw() got an unexpected keyword argument 'scale_len'`
-
-- [ ] **Step 3: Implement**
-
-```python
-def pq_bpw(
-    out: int, in_: int, sub_dim: int, n_centroids: int | list[int],
-    share_codebook: bool = True, scale_len: int | None = None,
-) -> float:
-    """Effective bits-per-weight including fp16 codebook storage, summed over residual stages.
-    `n_centroids` may be a single int (one stage) or a per-stage list. Sharing a single codebook
-    (vs one per group) is what drops the overhead from ~index-storage to negligible.
-
-    `scale_len` counts fp16 per-input-channel scales stored alongside the codes, as the
-    activation-weighted encode needs to undo its change of variables at reconstruction."""
-    stages = n_centroids if isinstance(n_centroids, list) else [n_centroids]
-    groups = in_ // sub_dim
-    n_codebooks = 1 if share_codebook else groups
-    total_bits = sum(
-        out * groups * math.log2(k) + n_codebooks * k * sub_dim * 16 for k in stages
-    )
-    if scale_len is not None:
-        total_bits += scale_len * 16
-    return total_bits / (out * in_)
-```
-
-- [ ] **Step 4: Run the full suite**
-
-Run: `PYTHONPATH=src .venv/bin/python -m pytest -q`
-Expected: PASS — 38 passed (35 baseline + 3 new cases).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/smart_quant/codebook.py tests/test_codebook.py
-git commit -m "feat: scale_len term on pq_bpw for weighted-encode storage"
-```
+Written for the pre-scaling mechanism, which needed to store `w`. Per-dimension weighted k-means stores
+nothing extra, so `pq_bpw` is untouched and this task has no purpose. Implemented, then rewound.
 
 ---
 
-### Task 3: Scaled-space quantization in the encode path
+### ~~Task 3: Weighted codebook fit~~ — COMPLETE (`8fb4ed5`)
 
-The core of the phase.
+Shipped as **per-dimension weighted k-means**, not the pre-scaling this plan originally specified. See
+[the spec](../specs/2026-07-29-weighted-pq-phase7-design.md) for why pre-scaling was measured and
+rejected: it minimizes the weighted objective over a reconstruction family that does not contain the
+baseline's, and loses to it 0/5 seeds on i.i.d. data.
 
-**Files:**
-- Modify: `src/smart_quant/encode.py` — module docstring (lines 1-11, the `(d_in, d_out)` claim is wrong), `quantize_fused_experts` (37-56), `quantize_experts` (59-91)
-- Test: `tests/test_encode.py`
+What landed:
+- `assign(x, centroids, dim_weight=None)` — one shared metric helper so the fit and the final
+  assignment cannot diverge.
+- `lloyd_kmeans(..., dim_weight)` — weighted assignment *and* centroid update.
+- `pq_quantize(..., channel_weight)` / `residual_pq_quantize(..., channel_weight)` — tile per-channel
+  weights to the pool; `max_fit` selection hoisted to a shared `sel` so points and weights stay aligned.
+- `quantize_fused_experts(..., channel_weight)` accepting `(in_,)` or `(num_experts, in_)`;
+  `quantize_experts(..., importance)` keyed by full parameter name.
+- `encode.py` module docstring corrected — it claimed `(num_experts, d_in, d_out)`; the real layout is
+  `(num_experts, out_features, in_features)`.
 
-**Interfaces:**
-- Consumes: `pq_bpw(..., scale_len=...)` from Task 2.
-- Produces:
-  - `quantize_fused_experts(weight, bits_per_expert, sub_dim, iters=10, codebook_order=1, sample_weight: torch.Tensor | None = None) -> tuple[float, int]` — `sample_weight` is `(in_features,)` shared across experts or `(num_experts, in_features)` per expert.
-  - `quantize_experts(model, avg_bits, sub_dim=4, freqs=None, iters=10, bits_lo=1.5, bits_hi=3.0, codebook_order=1, importance: dict[str, torch.Tensor] | None = None) -> list[dict[str, Any]]` — `importance` keyed by full fused parameter name, e.g. `language_model.layers.0.mlp.experts.gate_up_proj`.
-
-- [ ] **Step 1: Write the failing tests**
-
-Add to `tests/test_encode.py`:
-
-```python
-class TestWeightedFusedExperts:
-    def test_none_weight_is_byte_identical(self):
-        torch.manual_seed(0)
-        base = torch.randn(2, 64, 128)
-        a, b = base.clone(), base.clone()
-        r1 = quantize_fused_experts(a, torch.full((2,), 2.0), sub_dim=4, iters=5)
-        r2 = quantize_fused_experts(b, torch.full((2,), 2.0), sub_dim=4, iters=5,
-                                    sample_weight=None)
-        assert r1 == r2
-        assert torch.equal(a, b)
-
-    def test_heavy_input_channels_reconstruct_better(self):
-        # channels 0:16 weighted 50x must end up closer than under the unweighted fit,
-        # and the ignored channels correspondingly worse — the whole point of the feature
-        torch.manual_seed(1)
-        base = torch.randn(1, 64, 128)
-        sw = torch.ones(128)
-        sw[:16] = 50.0
-        plain, weighted = base.clone(), base.clone()
-        quantize_fused_experts(plain, torch.full((1,), 1.5), sub_dim=4, iters=15)
-        quantize_fused_experts(weighted, torch.full((1,), 1.5), sub_dim=4, iters=15,
-                               sample_weight=sw)
-        err_p = (plain[0, :, :16] - base[0, :, :16]).pow(2).mean()
-        err_w = (weighted[0, :, :16] - base[0, :, :16]).pow(2).mean()
-        assert err_w < err_p
-        rest_p = (plain[0, :, 16:] - base[0, :, 16:]).pow(2).mean()
-        rest_w = (weighted[0, :, 16:] - base[0, :, 16:]).pow(2).mean()
-        assert rest_w > rest_p
-
-    def test_minimizes_the_weighted_objective(self):
-        # the change-of-variables claim: scaled-space fitting must lower total *weighted*
-        # error, even though it raises unweighted error
-        torch.manual_seed(2)
-        base = torch.randn(1, 64, 128)
-        sw = torch.rand(128) * 10 + 0.1
-        plain, weighted = base.clone(), base.clone()
-        quantize_fused_experts(plain, torch.full((1,), 1.5), sub_dim=4, iters=15)
-        quantize_fused_experts(weighted, torch.full((1,), 1.5), sub_dim=4, iters=15,
-                               sample_weight=sw)
-        werr_p = (sw * (plain[0] - base[0]).pow(2)).mean()
-        werr_w = (sw * (weighted[0] - base[0]).pow(2)).mean()
-        assert werr_w < werr_p
-
-    def test_footprint_includes_the_scale_vector(self):
-        torch.manual_seed(3)
-        w = torch.randn(2, 64, 128)
-        bits_p, n = quantize_fused_experts(w.clone(), torch.full((2,), 2.0), sub_dim=4, iters=5)
-        bits_w, n2 = quantize_fused_experts(w.clone(), torch.full((2,), 2.0), sub_dim=4, iters=5,
-                                            sample_weight=torch.rand(128) + 0.1)
-        assert n == n2
-        # one fp16 scale per input channel per expert: 2 experts * 128 * 16 bits
-        assert bits_w - bits_p == pytest.approx(2 * 128 * 16, rel=1e-9)
-
-    def test_per_expert_2d_weight_accepted(self):
-        torch.manual_seed(4)
-        w = torch.randn(3, 64, 128)
-        bits, n = quantize_fused_experts(w, torch.full((3,), 2.0), sub_dim=4, iters=5,
-                                         sample_weight=torch.rand(3, 128) + 0.1)
-        assert n == 3 * 64 * 128
-        assert torch.isfinite(w).all()
-```
-
-- [ ] **Step 2: Run to verify they fail**
-
-Run: `PYTHONPATH=src .venv/bin/python -m pytest tests/test_encode.py::TestWeightedFusedExperts -v`
-Expected: FAIL — `TypeError: quantize_fused_experts() got an unexpected keyword argument 'sample_weight'`
-
-- [ ] **Step 3: Fix the wrong module docstring**
-
-Replace lines 3-4 of `src/smart_quant/encode.py`. The recon confirmed the layout is the standard `nn.Linear` one, because the forward uses `F.linear(x, W)`:
-
-```python
-transformers >=5 stores experts as fused `(num_experts, out_features, in_features)` tensors —
-the standard `nn.Linear` layout, since the forward applies `F.linear(x, W)`. Each expert is a 2D
-slice `W[e]`. We product-quantize each slice with a shared codebook at a per-expert bit budget —
-uniform, or driven by routing usage via `bits_from_frequency` — then write the dequantized
-reconstruction back. This "fake quantization" lets the fp16 model reflect quantized weights for
-quality measurement without custom inference kernels.
-```
-
-- [ ] **Step 4: Implement `quantize_fused_experts`**
-
-Sub-vectors span `sub_dim` consecutive *input* channels, so `sample_weight` broadcasts across columns. The scaled space is computed in float32 for numerical headroom — fp16 `√w` can underflow on cold channels:
-
-```python
-def quantize_fused_experts(
-    weight: torch.Tensor, bits_per_expert: torch.Tensor, sub_dim: int, iters: int = 10,
-    codebook_order: int = 1, sample_weight: torch.Tensor | None = None,
-) -> tuple[float, int]:
-    """Fake-quantize a fused (num_experts, out_features, in_features) weight in place along the
-    expert dim, each expert at its own `bits_per_expert` budget. With `codebook_order > 1` the
-    budget is split evenly across that many residual stages. Returns (realized_bits, n_weights).
-
-    `sample_weight` is per-input-channel importance, (in_,) shared across experts or
-    (num_experts, in_) per expert. It is applied by change of variables: columns are scaled by
-    sqrt(w), the codebook is fit in that space, and the reconstruction is divided back out — which
-    exactly minimizes sum_ij w_j (W_ij - West_ij)^2. The scale vector is stored, so `pq_bpw` counts
-    it via `scale_len`."""
-    realized_bits, n_weights = 0.0, 0
-    for e in range(weight.shape[0]):
-        k = centroids_for_bits(float(bits_per_expert[e]) / codebook_order, sub_dim)
-        stage_centroids = [k] * codebook_order  # even split — every stage the same codebook size
-        max_fit = max(4096, k * 8)
-        out, in_ = weight[e].shape
-
-        if sample_weight is None:
-            target, w_sqrt, scale_len = weight[e], None, None
-        else:
-            w = sample_weight if sample_weight.dim() == 1 else sample_weight[e]
-            w_sqrt = w.to(device=weight.device, dtype=torch.float32).clamp(min=1e-12).sqrt()
-            target = weight[e].float() * w_sqrt
-            scale_len = in_
-
-        codes, codebooks = residual_pq_quantize(
-            target, sub_dim, stage_centroids, iters=iters, max_fit=max_fit)
-        recon = pq_dequantize(codes, codebooks)
-        weight[e] = (recon if w_sqrt is None else recon / w_sqrt).to(weight.dtype)
-
-        realized_bits += pq_bpw(out, in_, sub_dim, stage_centroids,
-                                scale_len=scale_len) * out * in_
-        n_weights += out * in_
-    return realized_bits, n_weights
-```
-
-- [ ] **Step 5: Implement `quantize_experts`**
-
-The fused-parameter comprehension currently discards names (`encode.py:71`); it must keep them, because `gate_up_proj` and `down_proj` have different `in_features` and so need different weight vectors:
-
-```python
-def quantize_experts(
-    model, avg_bits: float, sub_dim: int = 4, freqs: dict[str, torch.Tensor] | None = None,
-    iters: int = 10, bits_lo: float = 1.5, bits_hi: float = 3.0, codebook_order: int = 1,
-    importance: dict[str, torch.Tensor] | None = None,
-) -> list[dict[str, Any]]:
-    """Walk a model's fused MoE expert modules and fake-quantize them. With `freqs` (router
-    name -> usage frequencies), per-expert bits are water-filled to `avg_bits` by usage within
-    [bits_lo, bits_hi]; otherwise every expert gets `avg_bits`. `importance` maps a full fused
-    parameter name to its per-input-channel weights. Returns per-layer stats."""
-    freq_by_layer = {layer_index(k): v for k, v in freqs.items()} if freqs else {}
-    stats: list[dict[str, Any]] = []
-    for name, module in model.named_modules():
-        if not type(module).__name__.endswith("Experts"):
-            continue
-        fused = [(pn, p) for pn, p in module.named_parameters(recurse=False) if p.dim() == 3]
-        if not fused:
-            continue
-        n_experts = fused[0][1].shape[0]
-        freq = freq_by_layer.get(layer_index(name))
-        if freq is not None and len(freq) == n_experts:
-            bits = bits_from_frequency(freq, avg_bits, lo=bits_lo, hi=bits_hi)
-        else:
-            bits = torch.full((n_experts,), float(avg_bits))
-        layer_bits, layer_weights = 0.0, 0
-        with torch.no_grad():
-            for param_name, weight in fused:
-                sw = None if importance is None else importance.get(f"{name}.{param_name}")
-                fused_bits, fused_weights = quantize_fused_experts(
-                    weight, bits, sub_dim, iters, codebook_order=codebook_order, sample_weight=sw)
-                layer_bits += fused_bits
-                layer_weights += fused_weights
-        stats.append({"layer": name, "n_experts": n_experts,
-                      "bits_min": round(float(bits.min()), 2),
-                      "bits_max": round(float(bits.max()), 2),
-                      "quant_bits": layer_bits, "quant_weights": layer_weights})
-    return stats
-```
-
-Add `from typing import Any` to the imports at the top of `encode.py`.
-
-- [ ] **Step 6: Run the full suite**
-
-Run: `PYTHONPATH=src .venv/bin/python -m pytest -q`
-Expected: PASS — 43 passed (38 + 5 new cases).
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/smart_quant/encode.py tests/test_encode.py
-git commit -m "feat: activation-weighted quantization via scaled-space codebook fit"
-```
+Test fixtures use **heterogeneous** columns: weighting has nothing to exploit on i.i.d. data, so an
+i.i.d. fixture would assert the method does nothing. 49 passed.
 
 ---
 
@@ -653,7 +412,7 @@ Add next to `residual_curve`. The existing selectors both miss `wpq*-{expert,lay
 ```python
 def weighted_curve(rows: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
     """(bpw, ppl, label) for each activation-weighted first-order encode, sorted by footprint.
-    Every `wpq*` row carries a realized `expert_bpw` that includes its stored scale vector.
+    Every `wpq*` row carries a realized `expert_bpw` identical to its unweighted pair.
     Empty when no weighted rows exist."""
     pts = [(r["expert_bpw"], r["wikitext_ppl"], r["label"])
            for r in rows if r["label"].startswith("wpq")]
@@ -731,7 +490,7 @@ ps -ef | grep run_wpq_seq | grep -v grep
 
 Confirm column 3 (PPID) is `1`. If it is the shell's PID the run dies with the session.
 
-- [ ] **Step 4: Verify the footprint delta is the scale vector and nothing else**
+- [ ] **Step 4: Verify the footprint is identical, not merely close**
 
 As soon as `wpq20-expert` appends:
 
@@ -740,7 +499,7 @@ grep -E '"label": "(pq2-uniform|wpq20-expert)"' experiments/bits-per-brain/resul
   | python -c 'import sys,json; [print(json.loads(l)["label"], json.loads(l)["expert_bpw"]) for l in sys.stdin]'
 ```
 
-Expected: `pq2-uniform 2.0` and `wpq20-expert` at **~2.012** — the weighted average of +0.0156 (gate_up) and +0.0078 (down) over the two tensors. Materially more than that means something other than the scale vector changed the accounting; stop and diagnose before the remaining encodes.
+Expected: **both exactly `2.0`.** Weights steer the fit and change no bit count, so any difference at all means the accounting changed — stop and diagnose before the remaining encodes rather than reporting a comparison that is no longer matched.
 
 - [ ] **Step 5: Regenerate the plot and commit the PNG**
 
@@ -768,11 +527,11 @@ After the Phase-6 section, same shape (hypothesis, matched-footprint table, verd
 
 | footprint | uniform PQ | weighted (per-expert) | weighted (per-layer) |
 |---|---|---|---|
-| ~2.0 bpw | pq2 (2.00) 6.77 | wpq20-expert (2.01) _ppl_ | — |
-| ~2.5 bpw | pq25 (2.54) 6.21 | wpq25-expert (2.55) _ppl_ | wpq25-layer (2.50) _ppl_ |
+| ~2.0 bpw | pq2 (2.00) 6.77 | wpq20-expert (2.00) _ppl_ | — |
+| ~2.5 bpw | pq25 (2.54) 6.21 | wpq25-expert (2.54) _ppl_ | wpq25-layer (2.54) _ppl_ |
 ```
 
-State the verdict plainly whichever way it goes, and note that the weighted arms carry ~0.012 bpw of stored scale vector — reported, not tuned away. If both weighted arms lose, connect it to Phase 3 and Phase 6a: uniform first-order PQ has now resisted three separate attempts at non-uniform allocation.
+State the verdict plainly whichever way it goes, noting that footprints match exactly since weights change no bit count. If both weighted arms lose, connect it to Phase 3 and Phase 6a: uniform first-order PQ has now resisted three separate attempts at non-uniform allocation.
 
 - [ ] **Step 2: Run the suite one final time**
 

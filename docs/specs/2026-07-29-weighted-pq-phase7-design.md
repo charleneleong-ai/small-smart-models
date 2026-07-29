@@ -42,57 +42,59 @@ correctly named, and `pq_quantize` splits `in_` into `sub_dim`-wide groups — *
 input dim**. Importance `E[x_j²]` is per input channel, so the four elements of a sub-vector carry four
 *different* weights. The weighting is per-dimension, not per-sample.
 
-(The `encode.py` module docstring claims `(num_experts, d_in, d_out)`. That is wrong and is fixed in
-this phase.)
+(The `encode.py` module docstring claimed `(num_experts, d_in, d_out)` — wrong, and corrected in this
+phase. The code was always right.)
 
-## Design — pre-scaling
+## Design — per-dimension weighted k-means
 
-Per-dimension weighting is applied by change of variables rather than by rewriting the distance metric.
-Scale each input channel by `√w_j` before quantizing, fit in the scaled space, and divide back out on
-reconstruction. Because
+The codebook is fit by minimizing the weighted objective directly. Assignment and centroid update both
+use the per-dimension weighted squared distance, expanded to avoid materializing an `(n, k, d)`
+difference:
 
 ```
-Σ_d (√w_d·x_d − √w_d·c_d)²  ≡  Σ_d w_d(x_d − c_d)²
+||x − c||²_w  =  Σ_d w_d x_d²  −  2 Σ_d w_d x_d c_d  +  Σ_d w_d c_d²
 ```
 
-plain k-means on the scaled weights **exactly** minimizes the weighted objective. Pooling scaled
-sub-vectors from all groups into one shared codebook still minimizes the true global weighted error —
-the substitution is per-element, so the pooled sum is the weighted sum.
+Three matmuls — the same asymptotic cost as the `cdist` it replaces, since that is already
+`(out·groups) × k × d`. Both steps route through one shared
+[`assign`](../../src/smart_quant/codebook.py) helper so the fit and the final assignment cannot diverge.
 
-The alternative — collapsing each sub-vector's four weights to their mean and running weighted k-means —
-is an approximation of the same objective for no gain in simplicity, and is out of scope.
+**Why not pre-scaling.** Scaling columns by `√w`, fitting, and dividing back out is exactly equivalent
+for the objective — but over a *different reconstruction family*. It gives group `g` the effective
+codebook `C/√w_g`, where the unweighted baseline uses one `C` for every group. Neither family contains
+the other, so "minimizes the objective over its own family" says nothing about beating the baseline —
+and measured on this quantizer it loses (0/5 seeds i.i.d., 4/5 structured, against 5/5 for weighted
+k-means). The cause is that scaling spreads the pooled sub-vectors over a wider region, so a *shared*
+codebook — the thing that makes ~2 bpw reachable — fits everything worse. Pre-scaling also stores `w`
+and confounds weighting with AWQ-style per-channel rescaling. See
+[Out of scope](#out-of-scope).
 
 ### Where it lives
 
-Entirely in [`quantize_fused_experts`](../../src/smart_quant/encode.py).
-[`lloyd_kmeans`](../../src/smart_quant/codebook.py),
+[`lloyd_kmeans`](../../src/smart_quant/codebook.py) gains `dim_weight (n, d)`;
 [`pq_quantize`](../../src/smart_quant/codebook.py) and
-[`pq_dequantize`](../../src/smart_quant/codebook.py) are **untouched**:
+[`residual_pq_quantize`](../../src/smart_quant/codebook.py) gain `channel_weight (in_,)` and tile it to
+the pool. [`pq_dequantize`](../../src/smart_quant/codebook.py) and
+[`pq_bpw`](../../src/smart_quant/codebook.py) are **untouched** — reconstruction is still a plain
+codebook lookup.
 
-```python
-w_sqrt = importance[e].sqrt()                                   # (in_features,)
-codes, cbs = residual_pq_quantize(weight[e] * w_sqrt, ...)      # fit in scaled space
-weight[e] = (pq_dequantize(codes, cbs) / w_sqrt).to(weight.dtype)
-```
-
-### `pq_bpw` — scale storage
-
-The scale vector must be reconstructable at inference, so it is stored and counted. `pq_bpw` gains an
-optional `scale_len: int | None = None` term adding `scale_len * 16` bits:
-
-| tensor | `w` length | added bpw (per-expert) | added bpw (per-layer) |
-|---|---|---|---|
-| `gate_up_proj` | 2048 | 2048·16 / (1024·2048) = **0.0156** | /256 → 0.00006 |
-| `down_proj` | 512 | 512·16 / (2048·512) = **0.0078** | /256 → 0.00003 |
+The one subtlety is the `max_fit` subsample: points and weights must be indexed by the *same* tensor,
+so the selection is hoisted to a named `sel` rather than inlined twice.
 
 ### Matched-footprint discipline
 
-Weighting does not change `k`, index count, or codebook size — only where centroids land — so the only
-footprint delta is the scale vector above. Realized `expert_bpw` for the per-expert arm lands ~0.012
-higher than its unweighted pair (≈2.012 against `pq2-uniform`'s 2.000). **This is reported honestly
-rather than tuned away**: shrinking `k` to force a digit-exact match would handicap the arm under test
-with fewer centroids, which is a worse distortion than a 0.6% footprint difference stated plainly. The
-per-layer arm is matched to within 0.0001 and needs no caveat.
+Weights steer the fit and nothing else — `k`, index count, and codebook size are all unchanged, and
+nothing extra is stored. Realized `expert_bpw` for a weighted encode is therefore **identical** to its
+unweighted pair (`wpq20-*` at 2.000 against `pq2-uniform`'s 2.000, `wpq25-*` at 2.542 against
+`pq25-uniform`'s 2.542). No budget search and no caveat — the cleanest matched comparison in the study.
+
+### What weighting can and cannot exploit
+
+Weighting only pays when input channels genuinely differ. On i.i.d. columns every sub-vector is
+exchangeable, so favouring some merely wastes centroids — verified: the advantage vanishes entirely on
+`randn` data and is a consistent ~11% on heterogeneous columns, holding at every subsample ratio down to
+1/16. Unit tests therefore fit heterogeneous matrices; an i.i.d. fixture would test the one regime where
+the method is expected to do nothing.
 
 ## Calibration
 
@@ -127,23 +129,26 @@ statistic by token count:
 w_e = (n_e · w_e_raw + τ · w_layer) / (n_e + τ)      # τ = pseudo-count, default 1000 tokens
 ```
 
-A zero-token expert resolves exactly to `w_layer`. Each `w` is then normalized to mean 1, which also
-keeps `√w` near unity so the scaled weights stay in a sane numeric range.
+A zero-token expert resolves exactly to `w_layer`. Each `w` is then normalized to mean 1, so the fit is
+invariant to the statistic's absolute scale and comparable across experts.
 
 `α` (applying `w^α`) is exposed but defaults to `1.0`. Unmoderated activation magnitudes span orders of
-magnitude and can make k-means degenerate, with a few hot rows capturing every centroid; `α<1` is the
+magnitude and can make k-means degenerate, with a few hot channels capturing every centroid; `α<1` is the
 lever if the pure version degenerates rather than merely losing. Default stays pure so the first answer
 is clean.
 
 ## Wiring
 
-- [`encode.py`](../../src/smart_quant/encode.py) — `quantize_fused_experts` gains `sample_weight`
-  (`(in_,)` shared or `(num_experts, in_)` per expert) and does the scale/unscale; `quantize_experts`
+- [`encode.py`](../../src/smart_quant/encode.py) — `quantize_fused_experts` gains `channel_weight`
+  (`(in_,)` shared or `(num_experts, in_)` per expert); `quantize_experts`
   gains `importance: dict[str, torch.Tensor] | None` keyed by full fused parameter name, since
   `gate_up_proj` and `down_proj` have different `in_features`. Absent weights take the existing path,
   so Phase-5/6 encodes stay byte-identical.
 - [`cli.py`](../../src/smart_quant/cli.py) — `--importance-path` and `--importance-granularity` on
   `encode-eval`, plus a `profile-activations` command. Labels are `wpq<bpw>-<granularity>`.
+
+Note `quantize_experts` keys `importance` by **full parameter name**, not layer: `gate_up_proj` and
+`down_proj` have different `in_features` (2048 vs 512), so a per-layer key cannot serve both.
 
 ## Experiment
 
@@ -178,16 +183,22 @@ New cases in [`tests/test_encode.py`](../../tests/test_encode.py),
 [`tests/test_codebook.py`](../../tests/test_codebook.py), and
 [`tests/test_expert_importance.py`](../../tests/test_expert_importance.py), by area:
 
-- **Regression safety** — `sample_weight=None` leaves `quantize_fused_experts` byte-identical to today.
-- **Weighting has the intended effect** — heavily-weighted input channels reconstruct measurably better
-  than under the unweighted fit, and unweighted channels correspondingly worse.
-- **Exactness of the change of variables** — on a small case, the scaled-space fit achieves lower
-  *weighted* error than the unweighted fit, confirming the objective actually being minimized.
-- **`pq_bpw` scale term** — `scale_len` adds exactly `scale_len·16` bits and matches the table above.
+- **Regression safety** — absent weights leave `lloyd_kmeans`, `pq_quantize` and
+  `quantize_fused_experts` byte-identical to today; an all-ones `dim_weight` agrees with the unweighted
+  fit, which `None` alone would not catch.
+- **Optimizes what it claims** — weighted k-means achieves lower *weighted* error than the unweighted
+  fit, and the heavier dimension of a synthetic pair is fit more closely.
+- **`max_fit` weight alignment** — reversing the weight vector is the misalignment control: had the
+  subsample paired weights with the wrong points, the true and reversed vectors would be equally
+  (un)helpful.
+- **Footprint invariance** — `quantize_fused_experts` returns identical `(realized_bits, n_weights)`
+  with and without weights.
 - **Shrinkage** — zero-token expert resolves exactly to the layer statistic; high-count expert
   approaches its raw statistic; every row normalized to mean 1.
 - **Profiler** — attributes per routed expert from `top_k_index`, and the `down_proj` recompute matches
   a hand-computed `act_fn(gate)*up` on a tiny fixture.
+
+All quantizer fixtures use **heterogeneous** columns for the reason given above.
 
 ## Plot & doc
 
@@ -206,8 +217,13 @@ wiring + tests + encodes + plot + doc.
 
 ## Out of scope
 
-- **Per-sub-vector scalar weighting** — an approximation of the same objective; only interesting if the
-  scale-vector storage ever becomes a real constraint, which at 0.0156 bpw it is not.
+- **Pre-scaling (columns × `√w`)** — measured and rejected as the mechanism (above), but it is a real
+  technique in its own right: the per-group rescaling it induces is essentially AWQ-style per-channel
+  scaling. Worth revisiting as its **own arm** if weighting shows signal — never folded into the
+  weighted encode, where a win could not be attributed to weighting versus rescaling.
+- **Per-sub-vector scalar weighting** — collapsing each sub-vector's four weights to their mean. Measured
+  as near-inert (1/5 and 4/5 seeds, barely distinguishable from the unweighted fit), because a scalar
+  weight cannot change the assignment at all.
 - **Phase 6b vptq spike** — still deferred, not cancelled.
 - **AQLM joint beam-search** — unchanged from Phase 6a.
 - **`.pre-commit-config.yaml` ruff C901/PLR0915 gate** — repo-wide follow-up.
