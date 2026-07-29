@@ -1,8 +1,10 @@
 """Quality-vs-footprint plot for the bits-per-brain study: learned-codebook PQ against the
 Unsloth imatrix baseline at *matched* bits-per-weight.
 
-Reads the uniform-PQ sweep rows from `results.jsonl` (each carrying a realized `expert_bpw`)
-and overlays the phase-4 imatrix point. The imatrix ppl was measured in llama.cpp, so it is
+Reads the uniform first-order PQ sweep rows from `results.jsonl` (each carrying a realized
+`expert_bpw`), overlays the phase-4 imatrix point, and — when phase-6 `rvq*` rows are present
+— draws the second-order residual-VQ line beside them for a matched-footprint comparison. The
+imatrix ppl was measured in llama.cpp, so it is
 placed on the transformers axis by its degradation over a near-lossless reference (Q8 6.02),
 applied to the fp16 ceiling — the same delta-normalization the phase-4 table uses. A vertical
 locus at the imatrix footprint shows the two methods head-to-head at equal bpw.
@@ -26,10 +28,20 @@ IMATRIX_DEGRADATION = 0.078  # imatrix 6.49 is +7.8% vs Q8-llama.cpp 6.02 refere
 
 
 def uniform_curve(rows: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
-    """(bpw, ppl, label) for each uniform-PQ encode, sorted by footprint. Falls back to the
-    nominal `avg_bits` for pre-instrumentation rows that predate realized `expert_bpw`."""
+    """(bpw, ppl, label) for each first-order uniform-PQ encode, sorted by footprint. Falls
+    back to the nominal `avg_bits` for pre-instrumentation rows that predate realized
+    `expert_bpw`. Residual (`rvq*`) rows also end in `-uniform`, so exclude them here — they
+    are the separate second-order line drawn by `residual_curve`."""
     pts = [(r.get("expert_bpw", r.get("avg_bits")), r["wikitext_ppl"], r["label"])
-           for r in rows if r["label"].endswith("-uniform")]
+           for r in rows if r["label"].endswith("-uniform") and not r["label"].startswith("rvq")]
+    return sorted(pts, key=lambda p: p[0])
+
+
+def residual_curve(rows: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
+    """(bpw, ppl, label) for each residual (second-order) VQ encode, sorted by footprint.
+    Every `rvq*` row carries a realized `expert_bpw`. Empty when no residual rows exist."""
+    pts = [(r["expert_bpw"], r["wikitext_ppl"], r["label"])
+           for r in rows if r["label"].startswith("rvq")]
     return sorted(pts, key=lambda p: p[0])
 
 
@@ -53,6 +65,15 @@ def render(rows: list[dict[str, Any]], out: Path) -> dict[str, float]:
     for x, y, name in curve:
         ax.annotate(name.replace("-uniform", ""), (x, y), textcoords="offset points",
                     xytext=(6, 7), fontsize=8, color="#1e3a8a")
+
+    residual = residual_curve(rows)
+    if residual:
+        rxs, rys, _ = zip(*residual)
+        ax.plot(rxs, rys, "o-", color="#7c3aed", lw=2, ms=7,
+                label="residual codebook PQ (2-stage)", zorder=3)
+        for x, y, name in residual:
+            ax.annotate(name.replace("-uniform", ""), (x, y), textcoords="offset points",
+                        xytext=(6, -14), fontsize=8, color="#5b21b6")
 
     ax.axhline(fp16, ls="--", color="#6b7280", lw=1.3, label=f"fp16 ceiling ({fp16:.2f})")
     ax.axvline(IMATRIX_BPW, ls=":", color="#9ca3af", lw=1.2, zorder=1)

@@ -15,7 +15,7 @@ import math
 
 import torch
 
-__all__ = ["lloyd_kmeans", "pq_quantize", "pq_dequantize", "pq_bpw"]
+__all__ = ["lloyd_kmeans", "pq_quantize", "pq_dequantize", "pq_bpw", "residual_pq_quantize"]
 
 
 def lloyd_kmeans(x: torch.Tensor, k: int, iters: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
@@ -73,8 +73,13 @@ def pq_quantize(
     return codes, codebooks
 
 
-def pq_dequantize(codes: torch.Tensor, codebooks: torch.Tensor) -> torch.Tensor:
-    """Reconstruct the (out, in) weight from PQ codes + codebooks (shared 2D or per-group 3D)."""
+def pq_dequantize(codes: torch.Tensor | list[torch.Tensor],
+                  codebooks: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+    """Reconstruct the (out, in) weight. A single (codes, codebooks) pair reconstructs one
+    stage (shared 2D or per-group 3D codebook); a (codes_list, codebooks_list) pair sums the
+    per-stage reconstructions of a residual quantization."""
+    if isinstance(codes, list):
+        return sum(pq_dequantize(c, cb) for c, cb in zip(codes, codebooks))
     out, groups = codes.shape
     if codebooks.dim() == 2:  # shared: one codebook indexes every group
         recon = codebooks[codes]
@@ -83,13 +88,40 @@ def pq_dequantize(codes: torch.Tensor, codebooks: torch.Tensor) -> torch.Tensor:
     return recon.reshape(out, -1)
 
 
+def residual_pq_quantize(
+    weight: torch.Tensor,
+    sub_dim: int,
+    stage_centroids: list[int],
+    iters: int = 10,
+    share_codebook: bool = True,
+    max_fit: int | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Multi-stage residual product quantization: stage 0 quantizes `weight`, each later
+    stage quantizes the running residual `weight - sum(recon so far)`. Returns per-stage
+    (codes_list, codebooks_list); `stage_centroids=[k]` reproduces a single `pq_quantize`."""
+    codes_list: list[torch.Tensor] = []
+    codebooks_list: list[torch.Tensor] = []
+    residual = weight
+    last = len(stage_centroids) - 1
+    for stage, k in enumerate(stage_centroids):
+        codes, codebook = pq_quantize(residual, sub_dim, k, iters, share_codebook, max_fit)
+        codes_list.append(codes)
+        codebooks_list.append(codebook)
+        if stage < last:  # final stage's residual is never read — skip the dequantize
+            residual = residual - pq_dequantize(codes, codebook).to(weight.dtype)
+    return codes_list, codebooks_list
+
+
 def pq_bpw(
-    out: int, in_: int, sub_dim: int, n_centroids: int, share_codebook: bool = True
+    out: int, in_: int, sub_dim: int, n_centroids: int | list[int], share_codebook: bool = True
 ) -> float:
-    """Effective bits-per-weight including fp16 codebook storage. Sharing a single codebook
+    """Effective bits-per-weight including fp16 codebook storage, summed over residual stages.
+    `n_centroids` may be a single int (one stage) or a per-stage list. Sharing a single codebook
     (vs one per group) is what drops the overhead from ~index-storage to negligible."""
+    stages = n_centroids if isinstance(n_centroids, list) else [n_centroids]
     groups = in_ // sub_dim
-    index_bits = out * groups * math.log2(n_centroids)
     n_codebooks = 1 if share_codebook else groups
-    codebook_bits = n_codebooks * n_centroids * sub_dim * 16
-    return (index_bits + codebook_bits) / (out * in_)
+    total_bits = sum(
+        out * groups * math.log2(k) + n_codebooks * k * sub_dim * 16 for k in stages
+    )
+    return total_bits / (out * in_)
