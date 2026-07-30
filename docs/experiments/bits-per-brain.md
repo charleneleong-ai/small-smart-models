@@ -248,6 +248,65 @@ codebook does not widen the margin. A true *additive* second codebook (more bits
 re-split) is a different, unmatched comparison and out of scope. Design:
 [`docs/specs/2026-07-28-residual-vq-phase6-design.md`](../specs/2026-07-28-residual-vq-phase6-design.md).
 
+### Phase 7 — activation-weighted first-order PQ (matched footprint)
+
+Phase 6a's negative had a confound: [`lloyd_kmeans`](../../src/smart_quant/codebook.py) minimizes raw
+weight MSE, treating every weight as equally important, so it may have tested *naive* residual VQ
+rather than residual VQ. Real VPTQ is Hessian-weighted. Phase 7 isolates that variable — importance
+weighting on the **first-order** quantizer, no residual stages — asking whether spending codebook
+resolution where activations are large beats uniform PQ at matched footprint.
+
+Importance is `E[x_j²]` per input channel, profiled over 512 C4 rows by
+[`ActivationImportanceProfiler`](../../src/smart_quant/expert_importance.py). Because sub-vectors run
+along the *input* dim (fused experts are `(num_experts, out_features, in_features)`), a sub-vector's
+four coordinates carry four different weights — so the fit uses **per-dimension weighted k-means**, not
+a per-sample scalar. Weights steer centroid placement and nothing else, so realized `expert_bpw` is
+*identical* to the unweighted pair by construction: `wpq25-expert` and `pq25-uniform` both land at
+2.542. No budget search, the cleanest matched comparison in the study.
+
+| footprint | uniform PQ | weighted (per-expert) | weighted (per-layer) |
+|---|---|---|---|
+| ~2.0 bpw | `pq2` 6.765 | `wpq20-expert` (2.01) **6.8163** | — |
+| ~2.5 bpw | `pq25` (2.542) 6.2137 | `wpq25-expert` (2.542) **6.2325** | `wpq25-layer` (2.542) **6.2931** |
+
+**Verdict — negative, and both escape hatches are closed.** Weighting loses at both footprints (0.051
+and 0.019), and the two explanations that would have made this a plumbing result rather than a finding
+were tested and rejected:
+
+- *Per-expert statistics too noisy?* No. At top-8 of 256 the tail experts see few tokens, so this was
+  the live risk. But per-expert (6.2325) **beats** per-layer (6.2931) by 0.061 — three times its own
+  loss to uniform. Had the per-expert signal been noise, the far better-conditioned layer marginal
+  would have won. Specialization carries real information in the predicted direction.
+- *Fit degenerating on outlier channels?* Marginally real, nowhere near enough. Per-expert importance
+  spans 18,400x (0.05–915 on a mean-1 scale), so a few hot channels capturing every centroid was
+  plausible. Sweeping the `alpha` compression knob (`w**alpha`, all at 2.542 bpw) rules it out as the
+  explanation:
+
+  | alpha | dynamic range | ppl | vs uniform |
+  |---|---|---|---|
+  | 0 (≡ uniform) | 1x | 6.2137 | — |
+  | 0.25 | 12x | 6.2645 | -0.051 |
+  | 0.5 | 142x | 6.2616 | -0.048 |
+  | **0.75** | 1,610x | **6.2253** | **-0.012** |
+  | 1.0 | 18,400x | 6.2325 | -0.019 |
+
+  The response is non-monotonic: *heavy* compression is worst, and mild compression (`alpha=0.75`) is
+  the best weighted variant, beating pure `alpha=1.0` by 0.007. So outlier sensitivity exists — but the
+  best setting the knob can reach still loses to uniform by 0.012, and no setting reaches it. The
+  ceiling of the method is below the baseline, which is not a tuning problem.
+
+So the weighted-MSE objective simply is not aligned with perplexity for this quantizer. Note the
+magnitude though: weighting is roughly *neutral* (0.02–0.05) where residual VQ was clearly *harmful*
+(0.32–0.68), an order of magnitude closer to the baseline — these are not the same kind of failure and
+the Phase-7 line sits just above the uniform curve rather than well above it.
+
+**Three strikes, one conclusion.** Phase 3 (expert-level bit allocation), Phase 6a (second-order
+residual codebooks) and Phase 7 (activation weighting) each tried to beat uniform first-order PQ by
+allocating capacity non-uniformly, and each lost at matched footprint. On this architecture, at this
+bit range, uniform PQ with a shared codebook is a hard baseline — and it is still the thing that beats
+imatrix by 3.2 pp. Design:
+[`docs/specs/2026-07-29-weighted-pq-phase7-design.md`](../specs/2026-07-29-weighted-pq-phase7-design.md).
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)

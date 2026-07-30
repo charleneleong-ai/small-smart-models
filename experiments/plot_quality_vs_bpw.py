@@ -12,6 +12,7 @@ locus at the imatrix footprint shows the two methods head-to-head at equal bpw.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,21 +28,38 @@ IMATRIX_BPW = 2.6
 IMATRIX_DEGRADATION = 0.078  # imatrix 6.49 is +7.8% vs Q8-llama.cpp 6.02 reference
 
 
-def uniform_curve(rows: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
-    """(bpw, ppl, label) for each first-order uniform-PQ encode, sorted by footprint. Falls
-    back to the nominal `avg_bits` for pre-instrumentation rows that predate realized
-    `expert_bpw`. Residual (`rvq*`) rows also end in `-uniform`, so exclude them here — they
-    are the separate second-order line drawn by `residual_curve`."""
-    pts = [(r.get("expert_bpw", r.get("avg_bits")), r["wikitext_ppl"], r["label"])
-           for r in rows if r["label"].endswith("-uniform") and not r["label"].startswith("rvq")]
-    return sorted(pts, key=lambda p: p[0])
+@dataclass(frozen=True)
+class Family:
+    """One encode family's line on the chart: how to select its rows and how to draw them."""
+    prefix: str
+    color: str
+    annot_color: str
+    legend: str
+    offset: tuple[int, int]
 
 
-def residual_curve(rows: list[dict[str, Any]]) -> list[tuple[float, float, str]]:
-    """(bpw, ppl, label) for each residual (second-order) VQ encode, sorted by footprint.
-    Every `rvq*` row carries a realized `expert_bpw`. Empty when no residual rows exist."""
-    pts = [(r["expert_bpw"], r["wikitext_ppl"], r["label"])
-           for r in rows if r["label"].startswith("rvq")]
+# Order matters only for legend order. `uniform` is the residual of the others, so it is matched
+# by exclusion rather than by prefix — adding a family means adding a row here and nothing else.
+FAMILIES = (
+    Family("rvq", "#7c3aed", "#5b21b6", "residual codebook PQ (2-stage)", (6, -14)),
+    Family("wpq", "#0d9488", "#115e59", "activation-weighted PQ", (-9, 5)),
+)
+
+
+def curve(rows: list[dict[str, Any]], prefix: str | None) -> list[tuple[float, float, str]]:
+    """(bpw, ppl, label) sorted by footprint, for one encode family.
+
+    `prefix=None` selects the first-order uniform line: every `-uniform` row not claimed by a
+    prefixed family. It falls back to nominal `avg_bits` for pre-instrumentation rows that
+    predate realized `expert_bpw`; every prefixed family postdates it."""
+    claimed = tuple(f.prefix for f in FAMILIES)
+    if prefix is None:
+        pts = [(r.get("expert_bpw", r.get("avg_bits")), r["wikitext_ppl"], r["label"])
+               for r in rows
+               if r["label"].endswith("-uniform") and not r["label"].startswith(claimed)]
+    else:
+        pts = [(r["expert_bpw"], r["wikitext_ppl"], r["label"])
+               for r in rows if r["label"].startswith(prefix)]
     return sorted(pts, key=lambda p: p[0])
 
 
@@ -53,27 +71,32 @@ def interp_ppl(curve: list[tuple[float, float, str]], bpw: float) -> float:
     raise ValueError(f"{bpw} bpw outside the swept range [{curve[0][0]}, {curve[-1][0]}]")
 
 
+def draw_curve(ax, pts: list[tuple[float, float, str]], color: str, annot_color: str,
+               legend: str, offset: tuple[int, int], strip: str) -> None:
+    if not pts:
+        return
+    xs, ys, _ = zip(*pts)
+    ax.plot(xs, ys, "o-", color=color, lw=2, ms=7, label=legend, zorder=3)
+    for x, y, name in pts:
+        # a negative x offset means "label to the left", so anchor the text's right edge —
+        # families sharing a footprint must lean opposite ways or their labels stack
+        ax.annotate(name.replace(strip, ""), (x, y), textcoords="offset points",
+                    xytext=offset, fontsize=8, color=annot_color,
+                    ha="right" if offset[0] < 0 else "left")
+
+
 def render(rows: list[dict[str, Any]], out: Path) -> dict[str, float]:
-    curve = uniform_curve(rows)
+    uniform = curve(rows, None)
     fp16 = next(r["wikitext_ppl"] for r in rows if r["label"] == "fp16")
     imatrix_ppl = fp16 * (1 + IMATRIX_DEGRADATION)  # llama.cpp → transformers axis
-    pq_at_imatrix = interp_ppl(curve, IMATRIX_BPW)
+    pq_at_imatrix = interp_ppl(uniform, IMATRIX_BPW)
 
     fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    xs, ys, _ = zip(*curve)
-    ax.plot(xs, ys, "o-", color="#2563eb", lw=2, ms=7, label="learned codebook PQ (uniform)", zorder=3)
-    for x, y, name in curve:
-        ax.annotate(name.replace("-uniform", ""), (x, y), textcoords="offset points",
-                    xytext=(6, 7), fontsize=8, color="#1e3a8a")
-
-    residual = residual_curve(rows)
-    if residual:
-        rxs, rys, _ = zip(*residual)
-        ax.plot(rxs, rys, "o-", color="#7c3aed", lw=2, ms=7,
-                label="residual codebook PQ (2-stage)", zorder=3)
-        for x, y, name in residual:
-            ax.annotate(name.replace("-uniform", ""), (x, y), textcoords="offset points",
-                        xytext=(6, -14), fontsize=8, color="#5b21b6")
+    draw_curve(ax, uniform, "#2563eb", "#1e3a8a", "learned codebook PQ (uniform)",
+               (6, 7), "-uniform")
+    for fam in FAMILIES:
+        draw_curve(ax, curve(rows, fam.prefix), fam.color, fam.annot_color, fam.legend,
+                   fam.offset, "-uniform")
 
     ax.axhline(fp16, ls="--", color="#6b7280", lw=1.3, label=f"fp16 ceiling ({fp16:.2f})")
     ax.axvline(IMATRIX_BPW, ls=":", color="#9ca3af", lw=1.2, zorder=1)
@@ -83,9 +106,11 @@ def render(rows: list[dict[str, Any]], out: Path) -> dict[str, float]:
             label=f"PQ @ {IMATRIX_BPW} bpw (interp. {pq_at_imatrix:.2f})", zorder=4)
 
     gap_pct = (imatrix_ppl - pq_at_imatrix) / fp16 * 100
+    # placed above the imatrix marker: the 2.5-2.6 band is crowded with same-footprint points
+    # (pq25 and both wpq25 arms all sit at 2.542), so an offset to the right overlaps them
     ax.annotate(f"matched footprint\nPQ beats imatrix\nby {gap_pct:.1f} pp degradation",
-                (IMATRIX_BPW, (imatrix_ppl + pq_at_imatrix) / 2),
-                textcoords="offset points", xytext=(14, -4), fontsize=8.5, color="#065f46")
+                (IMATRIX_BPW, imatrix_ppl), textcoords="offset points", xytext=(10, 26),
+                fontsize=8.5, color="#065f46", ha="left")
 
     ax.set_xlabel("expert bits-per-weight (realized)")
     ax.set_ylabel("wikitext-2 perplexity  (lower = better)")
