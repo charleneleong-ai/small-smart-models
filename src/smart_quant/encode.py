@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 
 from smart_quant.codebook import pq_bpw, pq_dequantize, residual_pq_quantize
+from smart_quant.compensate import compensated_quantize_fused, damped_inverse
 # layer_index lives with the profiler that emits keys with it; re-exported here for callers.
 from smart_quant.expert_importance import bits_from_frequency, layer_index
 
@@ -35,6 +36,7 @@ def centroids_for_bits(bits: float, sub_dim: int, lo: int = 16, hi: int = 4096) 
 def quantize_fused_experts(
     weight: torch.Tensor, bits_per_expert: torch.Tensor, sub_dim: int, iters: int = 10,
     codebook_order: int = 1, channel_weight: torch.Tensor | None = None,
+    hinv_chol: torch.Tensor | None = None, rounds: int = 3, compensate: bool = True,
 ) -> tuple[float, int]:
     """Fake-quantize a fused (num_experts, out_features, in_features) weight in place along the
     expert dim, each expert at its own `bits_per_expert` budget. With `codebook_order > 1` the
@@ -42,7 +44,23 @@ def quantize_fused_experts(
     total stored bits (indices + shared codebooks, via `pq_bpw`) and the weight count.
 
     `channel_weight` is per-input-channel importance, (num_experts, in_) — the caller normalizes
-    a layer-granularity vector by expanding it, so this loop never shape-dispatches."""
+    a layer-granularity vector by expanding it, so this loop never shape-dispatches.
+
+    `hinv_chol` enables GPTQ-style error compensation across this tensor's input dim. It changes
+    which codes are chosen, never the bit count, so the returned footprint is identical to the
+    uncompensated encode. Requires `codebook_order == 1` and no `channel_weight` — compensation
+    and the Phase-7 weighting are separate techniques and are not combined."""
+    if hinv_chol is not None:
+        if codebook_order != 1 or channel_weight is not None:
+            raise ValueError("compensation supports codebook_order=1 without channel_weight")
+        k = centroids_for_bits(float(bits_per_expert[0]), sub_dim)
+        compensated_quantize_fused(weight, sub_dim, k, hinv_chol, iters=iters,
+                                   max_fit=max(4096, k * 8), rounds=rounds,
+                                   compensate=compensate)
+        out, in_ = weight.shape[1], weight.shape[2]
+        n_experts = weight.shape[0]
+        return pq_bpw(out, in_, sub_dim, [k]) * out * in_ * n_experts, out * in_ * n_experts
+
     realized_bits, n_weights = 0.0, 0
     for e in range(weight.shape[0]):
         k = centroids_for_bits(float(bits_per_expert[e]) / codebook_order, sub_dim)
@@ -62,6 +80,8 @@ def quantize_experts(
     model, avg_bits: float, sub_dim: int = 4, freqs: dict | None = None, iters: int = 10,
     bits_lo: float = 1.5, bits_hi: float = 3.0, codebook_order: int = 1,
     importance: dict[str, torch.Tensor] | None = None,
+    hessians: dict[int, torch.Tensor] | None = None, rounds: int = 3,
+    compensate: bool = True,
 ) -> list[dict]:
     """Walk a model's fused MoE expert modules and fake-quantize them. With `freqs` (router
     name -> usage frequencies), per-expert bits are water-filled to `avg_bits` by usage within
@@ -70,7 +90,11 @@ def quantize_experts(
     `gate_up_proj` and `down_proj` have different `in_features`, and by layer *index* because the
     profiler and the encode load the model through different wrappers. A supplied `importance`
     that matches nothing raises rather than silently degrading to an unweighted encode — that
-    failure would otherwise be published as a null result. Returns per-layer stats."""
+    failure would otherwise be published as a null result. Returns per-layer stats.
+
+    `hessians` maps layer index to that layer's input second moment. Compensation is applied to
+    `gate_up_proj` only — `down_proj`'s intermediate is expert-specific and nearly isotropic, so
+    it stays uniform and serves as the phase's control."""
     freq_by_layer = {layer_index(k): v for k, v in freqs.items()} if freqs else {}
     matched = 0
     stats = []
@@ -96,18 +120,23 @@ def quantize_experts(
                         matched += 1
                         if cw.dim() == 1:  # layer granularity — one vector for every expert
                             cw = cw.expand(n_experts, -1)
+                hin = None
+                if hessians is not None and param_name == "gate_up_proj":
+                    h = hessians.get(layer_index(name))
+                    if h is not None:
+                        hin = damped_inverse(h)
+                        matched += 1
                 fused_bits, fused_weights = quantize_fused_experts(
                     weight, bits, sub_dim, iters, codebook_order=codebook_order,
-                    channel_weight=cw)
+                    channel_weight=cw, hinv_chol=hin, rounds=rounds, compensate=compensate)
                 layer_bits += fused_bits
                 layer_weights += fused_weights
         stats.append({"layer": name, "n_experts": n_experts,
                       "bits_min": round(float(bits.min()), 2),
                       "bits_max": round(float(bits.max()), 2),
                       "quant_bits": layer_bits, "quant_weights": layer_weights})
-    if importance is not None and not matched:
+    if (importance is not None or hessians is not None) and not matched:
         raise KeyError(
-            f"importance supplied but no key matched any fused expert parameter. "
-            f"Got keys like {sorted(importance)[:3]}; expected '<layer_index>.<param_name>', "
-            f"e.g. '0.gate_up_proj'. Re-run profile-activations to regenerate the artifact.")
+            "importance/hessians supplied but no key matched any fused expert parameter. "
+            "Expected importance keys '<layer_index>.<param_name>' and hessian keys <layer_index>.")
     return stats
