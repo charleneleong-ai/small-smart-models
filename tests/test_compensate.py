@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from smart_quant.codebook import assign, pq_dequantize, pq_quantize
-from smart_quant.compensate import damped_inverse, compensated_quantize
+from smart_quant.compensate import damped_inverse, compensated_quantize, compensated_quantize_fused
 from conftest import heterogeneous
 
 
@@ -101,3 +101,25 @@ class TestCompensatedQuantize:
         base_codes, base_cb = pq_quantize(w, 4, 16, iters=10)
         assert len(errs) == 3
         assert codes.shape == base_codes.shape and cb.shape == base_cb.shape   # footprint
+
+
+class TestBatchedCompensation:
+    def test_matches_the_single_tensor_reference_expert_for_expert(self):
+        torch.manual_seed(0)
+        base = torch.stack([heterogeneous(32, 16) for _ in range(3)])
+        x = correlated_inputs(1024, 16, rank=4, seed=7)
+        u = damped_inverse(x.T @ x / x.shape[0])
+
+        batched = base.clone()
+        compensated_quantize_fused(batched, 4, 16, u, iters=10, rounds=2)
+        for e in range(3):
+            codes, cb, _ = compensated_quantize(base[e], 4, 16, u, iters=10, rounds=2)
+            assert torch.allclose(batched[e], pq_dequantize(codes, cb), atol=1e-5)
+
+    def test_writes_reconstruction_in_place_and_reports_per_round(self):
+        torch.manual_seed(1)
+        w = torch.stack([heterogeneous(32, 16) for _ in range(2)])
+        orig = w.clone()
+        errs = compensated_quantize_fused(w, 4, 16, damped_inverse(torch.eye(16)), rounds=3)
+        assert len(errs) == 3
+        assert not torch.equal(w, orig) and torch.isfinite(w).all()

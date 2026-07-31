@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import torch
 
-from smart_quant.codebook import assign, pq_quantize
+from smart_quant.codebook import assign, pq_quantize, pq_dequantize
 
-__all__ = ["damped_inverse", "compensated_quantize"]
+__all__ = ["damped_inverse", "compensated_quantize", "compensated_quantize_fused"]
 
 
 def damped_inverse(h: torch.Tensor, damp: float = 0.01) -> torch.Tensor:
@@ -67,3 +67,51 @@ def compensated_quantize(
         errors.append(float((codebook[codes].reshape(out, in_) - weight).pow(2).mean()))
         w_fit = work
     return codes, codebook.to(weight.dtype), errors
+
+
+def compensated_quantize_fused(
+    weight: torch.Tensor,
+    sub_dim: int,
+    n_centroids: int,
+    hinv_chol: torch.Tensor,
+    iters: int = 10,
+    max_fit: int | None = None,
+    rounds: int = 3,
+    compensate: bool = True,
+) -> list[float]:
+    """`compensated_quantize` over a fused (n_experts, out, in) tensor, writing the
+    reconstruction back in place. Every expert in a layer shares `H` and the group order, so the
+    group loop runs once and assignment/compensation batch across experts — ~20k batched steps
+    for the whole model instead of 5.2M Python iterations.
+
+    Codebooks stay per-expert (as elsewhere in this codebase), so assignment is a batched cdist
+    against each expert's own centroids."""
+    n_experts, out, in_ = weight.shape
+    groups = in_ // sub_dim
+    u = hinv_chol.to(device=weight.device, dtype=torch.float32)
+    original = weight.float().clone()
+    w_fit, errors = original, []
+    codes = torch.empty(n_experts, out, groups, dtype=torch.long, device=weight.device)
+
+    for _ in range(rounds):
+        books = torch.stack([
+            pq_quantize(w_fit[e], sub_dim, n_centroids, iters, max_fit=max_fit)[1].float()
+            for e in range(n_experts)
+        ])                                                   # (n_experts, k, sub_dim)
+        work = original.clone()
+        for g in range(groups):
+            lo, hi = g * sub_dim, (g + 1) * sub_dim
+            codes[:, :, g] = torch.cdist(work[:, :, lo:hi], books).argmin(dim=2)
+            if compensate and hi < in_:
+                block_recon = torch.gather(
+                    books, 1, codes[:, :, g].unsqueeze(-1).expand(-1, -1, sub_dim))
+                delta = (work[:, :, lo:hi] - block_recon) @ torch.linalg.inv(u[lo:hi, lo:hi])
+                work[:, :, hi:] -= delta @ u[lo:hi, hi:]
+        full_recon = torch.gather(
+            books, 1, codes.reshape(n_experts, -1, 1).expand(-1, -1, sub_dim)
+        ).reshape(n_experts, out, in_)
+        errors.append(float((full_recon - original).pow(2).mean()))
+        w_fit = work
+
+    weight.copy_(full_recon.to(weight.dtype))
+    return errors
