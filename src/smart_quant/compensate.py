@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from smart_quant.codebook import assign, pq_quantize, pq_dequantize
+from smart_quant.codebook import assign, lloyd_kmeans
 
 __all__ = ["damped_inverse", "compensated_quantize", "compensated_quantize_fused"]
 
@@ -36,7 +36,7 @@ def compensated_quantize(
     compensate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, list[float]]:
     """Quantize a (out, in) weight group-by-group, pushing each group's error onto the columns
-    not yet quantized. Returns (codes, codebook, per-round reconstruction MSE).
+    not yet quantized. Returns (codes, codebook, per-round layerwise error).
 
     The quantization unit is a group of `sub_dim` adjacent input channels assigned atomically to
     one centroid, so per-column sequential quantization inside a group is unavailable — this is
@@ -46,6 +46,8 @@ def compensated_quantize(
     compensation pass from the original weights; compounding the correction would apply it
     repeatedly and diverge. Only `codes` and the final `codebook` are kept, so the footprint is
     identical to an uncompensated encode."""
+    if rounds < 1:
+        raise ValueError("rounds must be >= 1")
     out, in_ = weight.shape
     if in_ % sub_dim:
         raise ValueError(f"in_features {in_} not divisible by sub_dim {sub_dim}")
@@ -55,7 +57,10 @@ def compensated_quantize(
     codes = torch.empty(out, groups, dtype=torch.long, device=weight.device)
 
     for _ in range(rounds):
-        codebook = pq_quantize(w_fit, sub_dim, n_centroids, iters, max_fit=max_fit)[1].float()
+        pool = w_fit.reshape(out, groups, sub_dim).reshape(-1, sub_dim).float()
+        sel = (torch.linspace(0, pool.shape[0] - 1, max_fit).round().long()
+               if max_fit is not None and pool.shape[0] > max_fit else slice(None))
+        codebook = lloyd_kmeans(pool[sel], n_centroids, iters)[0]
         work = weight.float().clone()
         for g in range(groups):
             lo, hi = g * sub_dim, (g + 1) * sub_dim
@@ -64,7 +69,9 @@ def compensated_quantize(
                 err = work[:, lo:hi] - codebook[codes[:, g]]
                 delta = err @ torch.linalg.inv(u[lo:hi, lo:hi])
                 work[:, hi:] -= delta @ u[lo:hi, hi:]
-        errors.append(float((codebook[codes].reshape(out, in_) - weight).pow(2).mean()))
+        err = codebook[codes].reshape(out, in_) - weight
+        errors.append(float(torch.linalg.solve_triangular(
+            u, err, upper=True, left=False).pow(2).mean()))
         w_fit = work
     return codes, codebook.to(weight.dtype), errors
 
@@ -86,6 +93,8 @@ def compensated_quantize_fused(
 
     Codebooks stay per-expert (as elsewhere in this codebase), so assignment is a batched cdist
     against each expert's own centroids."""
+    if rounds < 1:
+        raise ValueError("rounds must be >= 1")
     n_experts, out, in_ = weight.shape
     groups = in_ // sub_dim
     u = hinv_chol.to(device=weight.device, dtype=torch.float32)
@@ -94,10 +103,13 @@ def compensated_quantize_fused(
     codes = torch.empty(n_experts, out, groups, dtype=torch.long, device=weight.device)
 
     for _ in range(rounds):
-        books = torch.stack([
-            pq_quantize(w_fit[e], sub_dim, n_centroids, iters, max_fit=max_fit)[1].float()
-            for e in range(n_experts)
-        ])                                                   # (n_experts, k, sub_dim)
+        books = []
+        for e in range(n_experts):
+            pool = w_fit[e].reshape(out, groups, sub_dim).reshape(-1, sub_dim).float()
+            sel = (torch.linspace(0, pool.shape[0] - 1, max_fit).round().long()
+                   if max_fit is not None and pool.shape[0] > max_fit else slice(None))
+            books.append(lloyd_kmeans(pool[sel], n_centroids, iters)[0])
+        books = torch.stack(books)                          # (n_experts, k, sub_dim)
         work = original.clone()
         for g in range(groups):
             lo, hi = g * sub_dim, (g + 1) * sub_dim
@@ -110,7 +122,9 @@ def compensated_quantize_fused(
         full_recon = torch.gather(
             books, 1, codes.reshape(n_experts, -1, 1).expand(-1, -1, sub_dim)
         ).reshape(n_experts, out, in_)
-        errors.append(float((full_recon - original).pow(2).mean()))
+        err = full_recon - original
+        errors.append(float(torch.linalg.solve_triangular(
+            u, err, upper=True, left=False).pow(2).mean()))
         w_fit = work
 
     weight.copy_(full_recon.to(weight.dtype))

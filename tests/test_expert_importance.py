@@ -86,22 +86,6 @@ class TestRouterSelection:
             assert freq.sum() == pytest.approx(1.0, abs=1e-5)
 
 
-class TinyExperts(nn.Module):
-    """Mirrors the transformers-5 fused Experts contract the profiler hooks: fused
-    (num_experts, out, in) params and a forward taking the routing."""
-
-    def __init__(self, num_experts: int = 4, hidden: int = 8, inter: int = 4):
-        super().__init__()
-        self.num_experts = num_experts
-        self.hidden = hidden
-        self.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * inter, hidden) * 0.1)
-        self.down_proj = nn.Parameter(torch.randn(num_experts, hidden, inter) * 0.1)
-        self.act_fn = nn.SiLU()
-
-    def forward(self, hidden_states, top_k_index, top_k_weights):
-        return torch.zeros_like(hidden_states)
-
-
 class TestShrinkImportance:
     @pytest.mark.parametrize("counts,expect_raw", [([0.0, 5e3, 5e3], False), ([1e7, 1e7, 1e7], True)])
     def test_shrinks_toward_layer_by_token_count(self, counts, expect_raw):

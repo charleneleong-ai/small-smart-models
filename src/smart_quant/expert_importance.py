@@ -209,13 +209,13 @@ class HessianProfiler:
     such shortcut; Phase 8 leaves it uniform.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module) -> None:
         self.model = model
         self.acc: dict[int, torch.Tensor] = {}
         self.counts: dict[int, int] = {}
         self.handles: list[torch.utils.hooks.RemovableHandle] = []
 
-    def make_hook(self, layer: int):
+    def make_hook(self, layer: int) -> Callable[[nn.Module, tuple[torch.Tensor, ...]], None]:
         def hook(_module: nn.Module, args: tuple[torch.Tensor, ...]) -> None:
             x = args[0].detach().reshape(-1, args[0].shape[-1]).float()
             gram = x.T @ x

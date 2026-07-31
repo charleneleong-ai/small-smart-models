@@ -1,4 +1,3 @@
-import pytest
 import torch
 
 from smart_quant.codebook import assign, pq_dequantize, pq_quantize
