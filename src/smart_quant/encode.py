@@ -53,6 +53,10 @@ def quantize_fused_experts(
     if hinv_chol is not None:
         if codebook_order != 1 or channel_weight is not None:
             raise ValueError("compensation supports codebook_order=1 without channel_weight")
+        if not bool((bits_per_expert == bits_per_expert[0]).all()):
+            raise ValueError(
+                "compensation requires uniform bits_per_expert — batching over experts needs one "
+                "codebook size, so per-expert allocation and compensation cannot be combined")
         k = centroids_for_bits(float(bits_per_expert[0]), sub_dim)
         compensated_quantize_fused(weight, sub_dim, k, hinv_chol, iters=iters,
                                    max_fit=max(4096, k * 8), rounds=rounds,
@@ -96,7 +100,8 @@ def quantize_experts(
     `gate_up_proj` only — `down_proj`'s intermediate is expert-specific and nearly isotropic, so
     it stays uniform and serves as the phase's control."""
     freq_by_layer = {layer_index(k): v for k, v in freqs.items()} if freqs else {}
-    matched = 0
+    matched_importance = 0
+    matched_hessians = 0
     stats = []
     for name, module in model.named_modules():
         if not type(module).__name__.endswith("Experts"):
@@ -117,7 +122,7 @@ def quantize_experts(
                 if importance is not None:
                     cw = importance.get(f"{layer_index(name)}.{param_name}")
                     if cw is not None:
-                        matched += 1
+                        matched_importance += 1
                         if cw.dim() == 1:  # layer granularity — one vector for every expert
                             cw = cw.expand(n_experts, -1)
                 hin = None
@@ -125,7 +130,7 @@ def quantize_experts(
                     h = hessians.get(layer_index(name))
                     if h is not None:
                         hin = damped_inverse(h)
-                        matched += 1
+                        matched_hessians += 1
                 fused_bits, fused_weights = quantize_fused_experts(
                     weight, bits, sub_dim, iters, codebook_order=codebook_order,
                     channel_weight=cw, hinv_chol=hin, rounds=rounds, compensate=compensate)
@@ -135,8 +140,12 @@ def quantize_experts(
                       "bits_min": round(float(bits.min()), 2),
                       "bits_max": round(float(bits.max()), 2),
                       "quant_bits": layer_bits, "quant_weights": layer_weights})
-    if (importance is not None or hessians is not None) and not matched:
+    if importance is not None and not matched_importance:
         raise KeyError(
-            "importance/hessians supplied but no key matched any fused expert parameter. "
-            "Expected importance keys '<layer_index>.<param_name>' and hessian keys <layer_index>.")
+            "importance supplied but no key matched any fused expert parameter. "
+            "Expected keys '<layer_index>.<param_name>', e.g. '0.gate_up_proj'.")
+    if hessians is not None and not matched_hessians:
+        raise KeyError(
+            "hessians supplied but no key matched any gate_up_proj layer. "
+            "Expected integer layer-index keys, e.g. 0.")
     return stats

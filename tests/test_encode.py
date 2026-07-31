@@ -128,6 +128,22 @@ class TestImportanceKeyContract:
             quantize_experts(consumer, avg_bits=2.0, iters=3,
                              importance={"model.layers.0.mlp.experts.gate_up_proj": torch.ones(8)})
 
+    def test_unmatched_hessians_raise_even_when_importance_matches(self):
+        # the shared-counter bug: valid importance masked a wrongly-keyed Hessian, so
+        # compensation silently no-opped while the results row still claimed it ran
+        torch.manual_seed(5)
+        producer = wrap_in_layers(TinyExperts(), prefix_depth=1)
+        from smart_quant.expert_importance import ActivationImportanceProfiler
+        with ActivationImportanceProfiler(producer, num_experts=4) as prof:
+            producer.inner.layers[0].mlp.experts(
+                torch.randn(8, 8), torch.zeros(8, 1, dtype=torch.long), torch.ones(8, 1))
+        good_importance = prof.importance("expert")
+
+        consumer = wrap_in_layers(TinyExperts(), prefix_depth=1)
+        with pytest.raises(KeyError, match="hessians supplied"):
+            quantize_experts(consumer, avg_bits=2.0, iters=3, importance=good_importance,
+                             hessians={"model.layers.0.mlp.experts": torch.eye(8)})
+
 
 class TestRealizedBpw:
     def test_accounts_exact_weights_and_near_nominal_bpw(self):
@@ -179,3 +195,11 @@ class TestCompensatedEncode:
         ce = comp.inner.layers[0].mlp.experts
         assert torch.equal(pe.down_proj, ce.down_proj)          # control untouched
         assert not torch.equal(pe.gate_up_proj, ce.gate_up_proj)
+
+    def test_non_uniform_bits_with_compensation_raises(self):
+        # per-expert allocation + compensation would silently inflate the footprint ~2.4x
+        torch.manual_seed(6)
+        w = heterogeneous(2, 32, 16)
+        with pytest.raises(ValueError, match="uniform bits_per_expert"):
+            quantize_fused_experts(w, torch.tensor([2.0, 2.5]), sub_dim=4, iters=5,
+                                   hinv_chol=damped_inverse(torch.eye(16)))
