@@ -83,6 +83,10 @@ def encode_eval(
     freqs_path: Path = typer.Option(Path("experiments/bits-per-brain/expert_freq.pt")),
     importance_path: Path | None = typer.Option(
         None, help="Activation importance .pt from profile-activations."),
+    hessian_path: Path | None = typer.Option(
+        None, help="Per-layer Hessian .pt from profile-hessian; enables compensation."),
+    rounds: int = typer.Option(3, help="Fit/compensate rounds."),
+    compensate: bool = typer.Option(True, help="--no-compensate runs the refit-only control."),
     dataset: str = typer.Option("Salesforce/wikitext"),
     config: str = typer.Option("wikitext-2-raw-v1"),
     max_length: int = typer.Option(4096),
@@ -106,9 +110,11 @@ def encode_eval(
     lm = load_causal_lm(model, dtype="auto", device_map="cuda").eval()
     freqs = torch.load(freqs_path, weights_only=True) if allocation == "expert" else None
     importance = torch.load(importance_path, weights_only=True) if importance_path else None
+    hessians = torch.load(hessian_path, weights_only=True) if hessian_path else None
     stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs,
                              bits_lo=bits_lo, bits_hi=bits_hi, codebook_order=codebook_order,
-                             importance=importance)
+                             importance=importance, hessians=hessians, rounds=rounds,
+                             compensate=compensate)
     span = [round(min(s["bits_min"] for s in stats), 2), round(max(s["bits_max"] for s in stats), 2)]
 
     # Realized footprint: expert_bpw is the honest per-weight cost of the quantized experts
@@ -127,6 +133,8 @@ def encode_eval(
            # a data point on the wrong arm of the phase-7 ablation
            "importance": None if importance is None else (
                "expert" if next(iter(importance.values())).dim() == 2 else "layer"),
+           "compensation": None if hessians is None else (
+               f"rounds={rounds}" if compensate else f"refit-only rounds={rounds}"),
            "wikitext_ppl": round(ppl, 4), "moe_layers": len(stats),
            "per_expert_bits_span": span, "expert_bpw": round(expert_bpw, 3),
            "model_bpw": round(model_bpw, 3)}
@@ -216,6 +224,27 @@ def profile_activations(
         torch.save(stats, path)
     console.print(f"profiled {len(expert)} expert tensors over {calib_rows} rows → "
                   f"{out_expert} (2-D) and {out_layer} (1-D)")
+
+
+@app.command("profile-hessian")
+def profile_hessian(
+    model: str = typer.Option(..., help="HF repo id or local path."),
+    calib_rows: int = typer.Option(512),
+    seq_len: int = typer.Option(2048),
+    out: Path = typer.Option(Path("experiments/expert_hessian.pt")),
+) -> None:
+    """Accumulate the per-layer input second moment for error compensation."""
+    import torch
+
+    from smart_quant.expert_importance import HessianProfiler
+
+    tok, lm, _, rows = load_for_calibration(model)
+    with HessianProfiler(lm) as prof:
+        stream_calibration(tok, lm, rows, calib_rows, seq_len)
+        hess = prof.hessians()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(hess, out)
+    console.print(f"profiled {len(hess)} layer Hessians over {calib_rows} rows → {out}")
 
 
 if __name__ == "__main__":
