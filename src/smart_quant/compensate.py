@@ -8,13 +8,13 @@ __all__ = ["damped_inverse", "compensated_quantize"]
 
 
 def damped_inverse(h: torch.Tensor, damp: float = 0.01) -> torch.Tensor:
-    """Upper Cholesky factor damped `H^-1`, in float64.
+    """Upper Cholesky factor of the damped `H^-1`, in float64.
 
-    `damp * mean(diag(H))` on diagonal GPTQ's standard preconditioning.
-    load-bearing here, not decorative: layer 0's covariance condition ~1e5
-    per-expert estimate over few routed tokens outright rank-deficient. Dead input channels
-    (all-zero column, real experts get unit diagonal contribute no
-    compensation non-positive-definite matrix."""
+    `damp * mean(diag(H))` on the diagonal is GPTQ's standard preconditioning. It is
+    load-bearing here, not decorative: layer 0's covariance has condition ~1e5 and any
+    per-expert estimate over few routed tokens is outright rank-deficient. Dead input channels
+    (all-zero column, which real experts have) get a unit diagonal so they contribute no
+    compensation rather than producing a non-positive-definite matrix."""
     n = h.shape[0]
     h = h.double().clone()
     d = torch.arange(n, device=h.device)
