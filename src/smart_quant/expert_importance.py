@@ -195,3 +195,46 @@ def bits_from_frequency(
             bits[i] = lo + surplus / freq[i].clamp(min=1e-9)
             surplus = 0.0
     return bits
+
+
+class HessianProfiler:
+    """Accumulates the input second moment `X^T X` per MoE layer over a calibration set.
+
+    Keyed by layer *index*, never module path, so the artifact survives the different wrapper
+    prefixes `AutoModel` (the profiler) and `AutoModelForCausalLM` (the encode) put on the same
+    modules — the failure mode that nearly shipped in Phase 7.
+
+    This is `gate_up_proj`'s input covariance: the hidden states entering the block, shared by
+    every expert in the layer. `down_proj`'s input is the expert-specific intermediate and has no
+    such shortcut; Phase 8 leaves it uniform.
+    """
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.acc: dict[int, torch.Tensor] = {}
+        self.counts: dict[int, int] = {}
+        self.handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def make_hook(self, layer: int):
+        def hook(_module: nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+            x = args[0].detach().reshape(-1, args[0].shape[-1]).float()
+            gram = x.T @ x
+            self.acc[layer] = gram if layer not in self.acc else self.acc[layer] + gram
+            self.counts[layer] = self.counts.get(layer, 0) + x.shape[0]
+        return hook
+
+    def __enter__(self) -> "HessianProfiler":
+        for name, module in self.model.named_modules():
+            layer = layer_index(name)
+            if type(module).__name__.endswith("Experts") and layer is not None:
+                self.handles.append(module.register_forward_pre_hook(self.make_hook(layer)))
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+    def hessians(self) -> dict[int, torch.Tensor]:
+        """Mean `x x^T` per layer, on CPU."""
+        return {k: (v / max(self.counts[k], 1)).cpu() for k, v in self.acc.items()}
