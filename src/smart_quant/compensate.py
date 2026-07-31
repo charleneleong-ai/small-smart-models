@@ -85,6 +85,7 @@ def compensated_quantize_fused(
     max_fit: int | None = None,
     rounds: int = 3,
     compensate: bool = True,
+    expert_chunk: int = 32,
 ) -> list[float]:
     """`compensated_quantize` over a fused (n_experts, out, in) tensor, writing the
     reconstruction back in place. Every expert in a layer shares `H` and the group order, so the
@@ -92,40 +93,57 @@ def compensated_quantize_fused(
     for the whole model instead of 5.2M Python iterations.
 
     Codebooks stay per-expert (as elsewhere in this codebase), so assignment is a batched cdist
-    against each expert's own centroids."""
+    against each expert's own centroids.
+
+    Experts are processed `expert_chunk` at a time. This is exact, not an approximation: each
+    expert has its own codebook and the computation never mixes experts — the only shared input
+    is `hinv_chol`, which is read-only. Chunking merely bounds how many `(out, in)`-shaped float32
+    tensors (original/work/reconstruction) are live at once; it does not change which experts are
+    grouped together for fitting or which values are produced. `expert_chunk` trades peak memory
+    for more (still batched) rounds of Python-level looping — it has no effect on the result."""
     if rounds < 1:
         raise ValueError("rounds must be >= 1")
     n_experts, out, in_ = weight.shape
     groups = in_ // sub_dim
     u = hinv_chol.to(device=weight.device, dtype=torch.float32)
-    original = weight.float().clone()
-    w_fit, errors = original, []
-    codes = torch.empty(n_experts, out, groups, dtype=torch.long, device=weight.device)
 
-    for _ in range(rounds):
-        books = []
-        for e in range(n_experts):
-            pool = w_fit[e].reshape(out, groups, sub_dim).reshape(-1, sub_dim).float()
-            sel = (torch.linspace(0, pool.shape[0] - 1, max_fit).round().long()
-                   if max_fit is not None and pool.shape[0] > max_fit else slice(None))
-            books.append(lloyd_kmeans(pool[sel], n_centroids, iters)[0])
-        books = torch.stack(books)                          # (n_experts, k, sub_dim)
-        work = original.clone()
-        for g in range(groups):
-            lo, hi = g * sub_dim, (g + 1) * sub_dim
-            codes[:, :, g] = torch.cdist(work[:, :, lo:hi], books).argmin(dim=2)
-            if compensate and hi < in_:
-                block_recon = torch.gather(
-                    books, 1, codes[:, :, g].unsqueeze(-1).expand(-1, -1, sub_dim))
-                delta = (work[:, :, lo:hi] - block_recon) @ torch.linalg.inv(u[lo:hi, lo:hi])
-                work[:, :, hi:] -= delta @ u[lo:hi, hi:]
-        full_recon = torch.gather(
-            books, 1, codes.reshape(n_experts, -1, 1).expand(-1, -1, sub_dim)
-        ).reshape(n_experts, out, in_)
-        err = full_recon - original
-        errors.append(float(torch.linalg.solve_triangular(
-            u, err, upper=True, left=False).pow(2).mean()))
-        w_fit = work
+    error_sums = [0.0] * rounds
+    total_elems = 0
 
-    weight.copy_(full_recon.to(weight.dtype))
-    return errors
+    for lo_e in range(0, n_experts, expert_chunk):
+        hi_e = min(lo_e + expert_chunk, n_experts)
+        n_chunk = hi_e - lo_e
+        original = weight[lo_e:hi_e].float().clone()
+        w_fit = original
+        codes = torch.empty(n_chunk, out, groups, dtype=torch.long, device=weight.device)
+        full_recon = original
+
+        for r in range(rounds):
+            books = []
+            for e in range(n_chunk):
+                pool = w_fit[e].reshape(out, groups, sub_dim).reshape(-1, sub_dim).float()
+                sel = (torch.linspace(0, pool.shape[0] - 1, max_fit).round().long()
+                       if max_fit is not None and pool.shape[0] > max_fit else slice(None))
+                books.append(lloyd_kmeans(pool[sel], n_centroids, iters)[0])
+            books = torch.stack(books)                      # (n_chunk, k, sub_dim)
+            work = original.clone()
+            for g in range(groups):
+                lo, hi = g * sub_dim, (g + 1) * sub_dim
+                codes[:, :, g] = torch.cdist(work[:, :, lo:hi], books).argmin(dim=2)
+                if compensate and hi < in_:
+                    block_recon = torch.gather(
+                        books, 1, codes[:, :, g].unsqueeze(-1).expand(-1, -1, sub_dim))
+                    delta = (work[:, :, lo:hi] - block_recon) @ torch.linalg.inv(u[lo:hi, lo:hi])
+                    work[:, :, hi:] -= delta @ u[lo:hi, hi:]
+            full_recon = torch.gather(
+                books, 1, codes.reshape(n_chunk, -1, 1).expand(-1, -1, sub_dim)
+            ).reshape(n_chunk, out, in_)
+            err = full_recon - original
+            error_sums[r] += float(torch.linalg.solve_triangular(
+                u, err, upper=True, left=False).pow(2).sum())
+            w_fit = work
+
+        weight[lo_e:hi_e].copy_(full_recon.to(weight.dtype))
+        total_elems += n_chunk * out * in_
+
+    return [s / total_elems for s in error_sums]

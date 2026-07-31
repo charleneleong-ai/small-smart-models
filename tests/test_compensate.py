@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from smart_quant.codebook import assign, pq_dequantize, pq_quantize
@@ -122,3 +123,16 @@ class TestBatchedCompensation:
         errs = compensated_quantize_fused(w, 4, 16, damped_inverse(torch.eye(16)), rounds=3)
         assert len(errs) == 3
         assert not torch.equal(w, orig) and torch.isfinite(w).all()
+
+    def test_chunking_is_exact_not_approximate(self):
+        # experts are independent given the shared Cholesky factor, so the chunk size must not
+        # change results at all — it only bounds peak memory
+        torch.manual_seed(9)
+        base = torch.stack([heterogeneous(32, 16) for _ in range(7)])
+        x = correlated_inputs(1024, 16, rank=4, seed=11)
+        u = damped_inverse(x.T @ x / x.shape[0])
+        whole, chunked = base.clone(), base.clone()
+        e_whole = compensated_quantize_fused(whole, 4, 16, u, iters=10, rounds=2, expert_chunk=99)
+        e_chunk = compensated_quantize_fused(chunked, 4, 16, u, iters=10, rounds=2, expert_chunk=2)
+        assert torch.equal(whole, chunked)
+        assert e_whole == pytest.approx(e_chunk, rel=1e-6)
