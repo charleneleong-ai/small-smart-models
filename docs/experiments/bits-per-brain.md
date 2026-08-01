@@ -307,6 +307,60 @@ bit range, uniform PQ with a shared codebook is a hard baseline — and it is st
 imatrix by 3.2 pp. Design:
 [`docs/specs/2026-07-29-weighted-pq-phase7-design.md`](../specs/2026-07-29-weighted-pq-phase7-design.md).
 
+### Phase 8 — GPTQ-style off-diagonal error compensation
+
+The [Phase-7 post-mortem](../weighting-diagnosis.md) closed the reweighting family: `E[x²]` **is** the
+layerwise Hessian diagonal, it is anti-correlated with where PQ errs, and no better diagonal exists to
+substitute. Phase 8 is the first phase to change the *algorithm* rather than the signal — quantize
+groups in order and push each group's error onto the not-yet-quantized columns along the directions
+the inputs actually co-vary, which is where GPTQ's and VPTQ's advantage lives.
+
+Target chosen by measurement, not assumption. Input covariance over 17k–23k calibration tokens
+(hot experts, so 32–45× oversampled rather than rank-deficient):
+
+| tensor | dim | effective rank | share of expert weights |
+|---|---|---|---|
+| `gate_up_proj` | 2048 | **588–711 (29–35%)** | ⅔ |
+| `down_proj` | 512 | 388–439 (76–86%) | ⅓ |
+
+`gate_up_proj`'s inputs occupy a third of their dimensions — that redundancy is what compensation
+feeds on. `down_proj` is near-isotropic, so it was left uniform and serves as a control.
+
+Compensation changes **which codes are chosen**, never what is stored, so realized `expert_bpw` is
+identical to the uniform pair by construction — 2.542 against 2.542, no budget search.
+
+| encode | rounds | compensation | expert bpw | ppl | vs uniform |
+|---|---|---|---|---|---|
+| `pq25-uniform` | — | — | 2.542 | **6.2137** | — |
+| `refit25-control` | 3 | off | 2.542 | 6.2137 | 0.000 |
+| `gptq25` | 3 | on | 2.542 | 6.2400 | **−0.026** |
+| `gptq25-r1` | 1 | on | 2.542 | 6.2653 | **−0.052** |
+| `pq2-uniform` | — | — | (2.010) | 6.765 | — |
+| `gptq20` | 3 | on | 2.010 | 6.8140 | **−0.049** |
+
+**Verdict — negative, and compensation is actively harmful rather than merely insufficient.** One
+round costs 0.052. The extra rounds are *damage control*: refitting the codebook onto the weights
+compensation displaced recovers half the loss (0.052 → 0.026) but never reaches baseline. That is the
+opposite of the GPTQ literature's result on dense layers, and the difference is the shared codebook —
+compensation moves weights away from centroids that were fit before it ran.
+
+**The `refit-only` control was degenerate, and saying so is the point.** It was specified as mandatory,
+to separate "extra k-means rounds" from "compensation". But with `compensate=False` the update never
+fires, so `work` stays equal to `original`, every round refits on identical weights, and deterministic
+k-means returns a bit-identical codebook — which is exactly what the 6.2137 tie shows. Rounds are not
+an independent factor: they only do anything *because* compensation displaces the weights the next
+round refits on. The control's real value turned out to be a regression proof that the compensated
+path with compensation off reproduces the uniform encode exactly.
+
+**Four techniques, one conclusion.** Phase 3 (expert-level bit allocation), Phase 6a (residual
+codebooks), Phase 7 (activation weighting) and Phase 8 (error compensation) each lost to uniform
+first-order PQ at matched footprint. The last two are the informative pair: they rest on opposite
+theories of what is wrong — reweight the fit, versus propagate error through the covariance — and at
+~2.0 bpw they land within 0.002 of each other (6.8163 vs 6.8140), both behind uniform. On this
+architecture, at this bit range, a shared codebook fit by plain k-means is a hard baseline, and it is
+still what beats imatrix by 3.2 pp. Design:
+[`docs/specs/2026-07-31-gptq-compensation-phase8-design.md`](../specs/2026-07-31-gptq-compensation-phase8-design.md).
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)

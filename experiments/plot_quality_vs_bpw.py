@@ -43,7 +43,13 @@ class Family:
 FAMILIES = (
     Family("rvq", "#7c3aed", "#5b21b6", "residual codebook PQ (2-stage)", (6, -14)),
     Family("wpq", "#0d9488", "#115e59", "activation-weighted PQ", (-9, 5)),
+    Family("gptq", "#ea580c", "#9a3412", "GPTQ error compensation", (6, 8)),
 )
+
+# Ablation runs share a footprint with the main arm of their family (Phase-7's alpha sweep,
+# Phase-8's rounds=1), so plotting them stacks two points on one x. They belong in the results
+# table, not on a curve.
+DIAGNOSTIC_SUFFIXES = ("-r1", "-control")
 
 
 def curve(rows: list[dict[str, Any]], prefix: str | None) -> list[tuple[float, float, str]]:
@@ -53,6 +59,7 @@ def curve(rows: list[dict[str, Any]], prefix: str | None) -> list[tuple[float, f
     prefixed family. It falls back to nominal `avg_bits` for pre-instrumentation rows that
     predate realized `expert_bpw`; every prefixed family postdates it."""
     claimed = tuple(f.prefix for f in FAMILIES)
+    rows = [r for r in rows if not r["label"].endswith(DIAGNOSTIC_SUFFIXES)]
     if prefix is None:
         pts = [(r.get("expert_bpw", r.get("avg_bits")), r["wikitext_ppl"], r["label"])
                for r in rows
