@@ -21,9 +21,34 @@ get bits, how codebooks are staged, how the fit is weighted, how error propagate
 un-rotated weight matrix. That does not invalidate the four negatives, but it reframes them: they are
 second-order questions asked while the first-order step is missing.
 
-Concretely, this is the single change most likely to move the ceiling, and it is orthogonal to
-everything already tried. A random Hadamard transform is cheap and needs no new calibration
-statistic beyond what `profile-hessian` already collects.
+That was the obvious top recommendation. It was then measured, and it does not survive.
+
+### …but it does not transfer to a *learned* codebook
+
+Quantizing `W` directly against quantizing `W@Q` under a random-sign Hadamard `Q` and mapping back
+with `Qᵀ` (orthogonal, so the layer's function is unchanged and the footprint is exactly matched),
+three sign draws per tensor:
+
+| tensor | mu plain → rotated | recon MSE | layerwise objective |
+|---|---|---|---|
+| L13 E18 | 6.15 → **5.03** | −0.6 to −0.8% (better) | **+2 to +3% (worse)** |
+| L26 E109 | 5.56 → **5.12** | +0.5 to −0.4% (noise) | **+4 to +5% (worse)** |
+
+The rotation does what it claims — incoherence drops materially. But weight-space MSE barely moves,
+and the layerwise objective gets **consistently worse across all six trials**.
+
+The likely reason is specific to this study: incoherence processing pays off for **fixed** codebooks —
+lattices (QuIP#), trellises (QTIP) — which cannot adapt to the data's shape, so you reshape the data
+to fit them. Our codebook is **learned by k-means**; it already adapts to whatever distribution the
+weights have. Rotating toward isotropy destroys structure the learned codebook was exploiting, and
+spreads error evenly across input directions when the input covariance is markedly low-rank (29–35%
+effective rank) — putting more error where the inputs actually live.
+
+If that reading is right, incoherence processing is not a missing first step for us; it is coupled to
+the fixed-codebook family and does not carry over. Caveats: this is a **one-sided** rotation on the
+input dim where QuIP is two-sided, it is two tensors, and Phase 7 showed the layerwise objective is
+itself an unreliable perplexity proxy. Reproduce with
+`experiments/diagnose_rotation.py`.
 
 ## The exponential constraint, and how the field escapes it
 
@@ -92,14 +117,19 @@ compete here and should not claim to.
 
 ## Implications, ranked
 
-1. **Add incoherence processing.** The field-standard first step, absent here, orthogonal to all four
-   negatives. Tests whether the ceiling itself moves rather than how capacity is divided under it.
-2. **Smaller `sub_dim`, more codebooks.** Two independent published results point this way, and the
-   intermediate-sharing axis is a one-line generalization of the current binary flag.
+1. **Smaller `sub_dim`, more codebooks.** Two independent published results point this way, and the
+   intermediate-sharing axis is a one-line generalization of today's binary `share_codebook` flag.
+   Now the top candidate, since rotation did not survive its own check.
+2. **Take the fixed-codebook family seriously, or state why not.** The measurement above suggests our
+   negatives and the field's positives may both be right, separated by learned-vs-fixed codebooks.
+   That is a testable claim: a lattice or trellis quantizer *should* benefit from rotation where ours
+   does not. It is also a much larger build than anything attempted so far.
 3. **State the MoE disagreement.** Four negatives on non-uniform allocation, against a field trend
    toward more of it, is a finding — but only if written as one.
 4. **Benchmark honestly against structured codebooks.** Our shared-codebook PQ is the unstructured
    baseline; QTIP/QuIP# are what a strong 2-bit result looks like in 2026.
+
+**Not recommended:** incoherence processing on the current quantizer, per the measurement above.
 
 ## Caveats on the cross-paper numbers
 
