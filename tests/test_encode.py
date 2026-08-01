@@ -145,6 +145,34 @@ class TestImportanceKeyContract:
                              hessians={"model.layers.0.mlp.experts": torch.eye(8)})
 
 
+class TestLatticeEncode:
+    def test_lattice_changes_the_result_and_reports_a_plausible_rate(self):
+        # hidden=64, inter=32 -> gate_up in_=64, down_proj in_=32, both divisible by 8, and each
+        # tensor holds enough sub-vectors to address a 0.75 bpw target
+        torch.manual_seed(0)
+        base = TinyExperts(num_experts=8, hidden=64, inter=32)
+        plain = wrap_in_layers(copy.deepcopy(base), prefix_depth=1)
+        latt = wrap_in_layers(copy.deepcopy(base), prefix_depth=1)
+        quantize_experts(plain, avg_bits=0.75, iters=3)
+        stats = quantize_experts(latt, avg_bits=0.75, iters=3, lattice=True)
+        pe = plain.inner.layers[0].mlp.experts
+        le = latt.inner.layers[0].mlp.experts
+        assert not torch.equal(pe.gate_up_proj, le.gate_up_proj)
+        assert torch.isfinite(le.gate_up_proj).all() and torch.isfinite(le.down_proj).all()
+        bpw = stats[0]["quant_bits"] / stats[0]["quant_weights"]
+        assert 0.5 <= bpw <= 1.5
+
+    def test_default_path_is_untouched(self):
+        torch.manual_seed(1)
+        base = TinyExperts(num_experts=8, hidden=64, inter=32)
+        a = wrap_in_layers(copy.deepcopy(base), prefix_depth=1)
+        b = wrap_in_layers(copy.deepcopy(base), prefix_depth=1)
+        quantize_experts(a, avg_bits=2.0, iters=3)
+        quantize_experts(b, avg_bits=2.0, iters=3, lattice=False)
+        assert torch.equal(a.inner.layers[0].mlp.experts.gate_up_proj,
+                           b.inner.layers[0].mlp.experts.gate_up_proj)
+
+
 class TestRealizedBpw:
     def test_accounts_exact_weights_and_near_nominal_bpw(self):
         torch.manual_seed(0)

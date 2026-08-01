@@ -23,6 +23,7 @@ from smart_quant.codebook import pq_bpw, pq_dequantize, residual_pq_quantize
 from smart_quant.compensate import compensated_quantize_fused, damped_inverse
 # layer_index lives with the profiler that emits keys with it; re-exported here for callers.
 from smart_quant.expert_importance import bits_from_frequency, layer_index
+from smart_quant.lattice import quantize_e8_fused
 
 __all__ = ["layer_index", "centroids_for_bits", "quantize_fused_experts", "quantize_experts"]
 
@@ -85,11 +86,17 @@ def quantize_experts(
     bits_lo: float = 1.5, bits_hi: float = 3.0, codebook_order: int = 1,
     importance: dict[str, torch.Tensor] | None = None,
     hessians: dict[int, torch.Tensor] | None = None, rounds: int = 3,
-    compensate: bool = True,
+    compensate: bool = True, lattice: bool = False,
 ) -> list[dict]:
     """Walk a model's fused MoE expert modules and fake-quantize them. With `freqs` (router
     name -> usage frequencies), per-expert bits are water-filled to `avg_bits` by usage within
-    [bits_lo, bits_hi]; otherwise every expert gets `avg_bits`. `importance` maps
+    [bits_lo, bits_hi]; otherwise every expert gets `avg_bits`.
+
+    `lattice=True` quantizes to the E8 lattice instead of a learned codebook. `avg_bits` then acts
+    as a *target* rate realized by per-tensor scale calibration, and `freqs`/`importance` are
+    ignored — a lattice takes no calibration statistic and has no per-expert codebook to weight.
+
+    `importance` maps
     `"<layer_index>.<param_name>"` to per-input-channel weights, keyed per *parameter* because
     `gate_up_proj` and `down_proj` have different `in_features`, and by layer *index* because the
     profiler and the encode load the model through different wrappers. A supplied `importance`
@@ -125,15 +132,20 @@ def quantize_experts(
                         matched_importance += 1
                         if cw.dim() == 1:  # layer granularity — one vector for every expert
                             cw = cw.expand(n_experts, -1)
-                hin = None
-                if hessians is not None and param_name == "gate_up_proj":
-                    h = hessians.get(layer_index(name))
-                    if h is not None:
-                        hin = damped_inverse(h)
-                        matched_hessians += 1
-                fused_bits, fused_weights = quantize_fused_experts(
-                    weight, bits, sub_dim, iters, codebook_order=codebook_order,
-                    channel_weight=cw, hinv_chol=hin, rounds=rounds, compensate=compensate)
+                if lattice:
+                    # the lattice has no fitted codebook, so neither error compensation nor
+                    # channel weighting applies — both are corrections to a k-means fit
+                    fused_bits, fused_weights = quantize_e8_fused(weight, avg_bits)
+                else:
+                    hin = None
+                    if hessians is not None and param_name == "gate_up_proj":
+                        h = hessians.get(layer_index(name))
+                        if h is not None:
+                            hin = damped_inverse(h)
+                            matched_hessians += 1
+                    fused_bits, fused_weights = quantize_fused_experts(
+                        weight, bits, sub_dim, iters, codebook_order=codebook_order,
+                        channel_weight=cw, hinv_chol=hin, rounds=rounds, compensate=compensate)
                 layer_bits += fused_bits
                 layer_weights += fused_weights
         stats.append({"layer": name, "n_experts": n_experts,
