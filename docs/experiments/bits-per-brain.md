@@ -341,8 +341,23 @@ identical to the uniform pair by construction — 2.542 against 2.542, no budget
 **Verdict — negative, and compensation is actively harmful rather than merely insufficient.** One
 round costs 0.052. The extra rounds are *damage control*: refitting the codebook onto the weights
 compensation displaced recovers half the loss (0.052 → 0.026) but never reaches baseline. That is the
-opposite of the GPTQ literature's result on dense layers, and the difference is the shared codebook —
-compensation moves weights away from centroids that were fit before it ran.
+opposite of the GPTQ literature's result on dense layers.
+
+**The mechanism is codebook drift, measured not assumed**
+([`experiments/diagnose_drift.py`](../../experiments/diagnose_drift.py)). GPTQ assumes a *fixed*
+quantizer, so displacing not-yet-quantized columns is free. Our codebook is fit before the pass runs,
+so displacement carries sub-vectors away from their centroids. That predicts assignment distance
+should grow with group index under compensation and stay flat without it — which is what happens,
+across all four (layer, expert) pairs sampled:
+
+| | first→last octile, plain | first→last octile, compensated | overall assignment error |
+|---|---|---|---|
+| 4 tensors, layers 13 & 26 | **0.99–1.01x** (flat) | **1.04–1.06x** (rising) | **1.025–1.028x worse** |
+
+Strict octile-by-octile monotonicity holds in only 2 of the 4 — the trend is robust, the step ordering
+is not. A ~3% worse codebook fit is the price compensation pays, and it exceeds what the compensation
+buys. This also explains why refitting helps: moving centroids onto the displaced weights cancels part
+of the drift, which is exactly the 0.052 → 0.026 recovery.
 
 **The `refit-only` control was degenerate, and saying so is the point.** It was specified as mandatory,
 to separate "extra k-means rounds" from "compensation". But with `compensate=False` the update never
