@@ -66,17 +66,30 @@ def distinct_points(pts: torch.Tensor) -> int:
     return int(torch.unique(h).numel())
 
 
+HEADROOM = 4  # sub-vectors per addressable point before the fit degenerates into memorisation
+
+
 def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
-                    iters: int = 24, max_fit: int = 2_000_000) -> float:
+                    iters: int = 24, max_fit: int = 8_000_000) -> float:
     """Scale whose distinct-point count realizes `target_bpw`.
 
     Distinct count decreases monotonically as the scale coarsens, so bisection converges — in the
     geometric mean, since usable scales span orders of magnitude. Calibrated on a strided
     subsample for speed; the caller re-measures the realized rate on the full tensor, so a
-    subsample that lands off-target shows up in the reported bpw rather than silently."""
+    subsample that lands off-target shows up in the reported bpw rather than silently.
+
+    Raises when the pool cannot support the target. Without that guard the bisection never sees a
+    count above target, drives the scale to its floor, and hands back a near-lossless fit in which
+    almost every sub-vector has its own code — memorisation, not quantisation, reported at a
+    fictional rate. That degeneracy is exactly what invalidated an early 2^20 measurement."""
     fit = pool if pool.shape[0] <= max_fit else pool[
         torch.linspace(0, pool.shape[0] - 1, max_fit).round().long()]
     target_points = 2.0 ** (target_bpw * sub_dim)
+    if fit.shape[0] < HEADROOM * target_points:
+        raise ValueError(
+            f"{fit.shape[0]} sub-vectors cannot realize {target_bpw} bpw: that needs "
+            f"{target_points:.0f} addressable points and at least {HEADROOM}x as many "
+            f"sub-vectors. Raise max_fit, or use a larger tensor.")
     lo, hi = 1e-5, 1.0
     for _ in range(iters):
         mid = (lo * hi) ** 0.5

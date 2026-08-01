@@ -3,7 +3,8 @@ import math
 import pytest
 import torch
 
-from smart_quant.lattice import distinct_points, nearest_e8
+from smart_quant.lattice import (
+    calibrate_scale, distinct_points, nearest_e8, quantize_e8_fused)
 
 
 def on_e8(p: torch.Tensor) -> bool:
@@ -52,3 +53,56 @@ class TestDistinctPoints:
         torch.manual_seed(4)
         pts = nearest_e8(torch.randn(128, 8) * 2)
         assert distinct_points(pts.repeat(5, 1)) == distinct_points(pts)
+
+
+class TestCalibrateScale:
+    def test_hits_the_target_rate(self):
+        # 1.5 bpw needs 2^12 points; 200k sub-vectors clears the 4x headroom comfortably. A 2.5
+        # target would need >4M sub-vectors, which is a box-scale tensor, not a unit test.
+        torch.manual_seed(5)
+        pool = torch.randn(200_000, 8) * 0.01
+        s = calibrate_scale(pool, target_bpw=1.5)
+        rate = math.ceil(math.log2(distinct_points(nearest_e8(pool / s)))) / 8
+        assert abs(rate - 1.5) <= 0.125          # one bit of index granularity
+
+    def test_coarser_scale_gives_fewer_points(self):
+        # monotonicity is exactly what makes the bisection valid
+        torch.manual_seed(6)
+        pool = torch.randn(50_000, 8) * 0.01
+        counts = [distinct_points(nearest_e8(pool / s)) for s in (0.004, 0.008, 0.016)]
+        assert counts[0] > counts[1] > counts[2]
+
+    def test_refuses_a_target_the_pool_cannot_address(self):
+        # without this guard the bisection bottoms out and returns a near-lossless fit at a
+        # fictional rate — one code per sub-vector, which memorizes rather than quantizes
+        torch.manual_seed(7)
+        with pytest.raises(ValueError, match="cannot realize"):
+            calibrate_scale(torch.randn(1024, 8) * 0.01, target_bpw=2.5)
+
+
+class TestQuantizeE8Fused:
+    def test_writes_reconstruction_and_charges_no_codebook(self):
+        torch.manual_seed(8)
+        w = torch.randn(8, 64, 128) * 0.01          # 8192 sub-vectors
+        orig = w.clone()
+        bits, n = quantize_e8_fused(w, target_bpw=1.0)
+        assert n == 8 * 64 * 128
+        assert not torch.equal(w, orig) and torch.isfinite(w).all()
+        # index cost plus one fp16 scale, and nothing else. A stored codebook at this dimension
+        # would add ~4 bpw, which is the entire reason for using a lattice.
+        used = distinct_points(w.reshape(-1, 8) / w.reshape(-1, 8).abs()[
+            w.reshape(-1, 8).abs() > 0].min())
+        assert bits == pytest.approx(math.ceil(math.log2(used)) * (n / 8) + 16, rel=0.15)
+
+    def test_higher_target_gives_lower_error(self):
+        torch.manual_seed(9)
+        base = torch.randn(8, 64, 128) * 0.01       # 8192 sub-vectors: clears 4x for 1.25 bpw
+        lo, hi = base.clone(), base.clone()
+        quantize_e8_fused(lo, target_bpw=0.75)
+        quantize_e8_fused(hi, target_bpw=1.25)
+        assert (hi - base).pow(2).mean() < (lo - base).pow(2).mean()
+
+    @pytest.mark.parametrize("shape,sub_dim", [((1, 8, 20), 8), ((1, 8, 16), 4)])
+    def test_rejects_bad_geometry(self, shape, sub_dim):
+        with pytest.raises(ValueError):
+            quantize_e8_fused(torch.randn(*shape), target_bpw=2.5, sub_dim=sub_dim)
