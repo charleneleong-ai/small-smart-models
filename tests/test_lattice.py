@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from smart_quant.lattice import (
-    calibrate_scale, distinct_points, nearest_e8, quantize_e8_fused)
+    calibrate_scale, distinct_points, nearest_e8, quantize_e8_fused, strided_indices)
 
 
 def on_e8(p: torch.Tensor) -> bool:
@@ -53,6 +53,25 @@ class TestDistinctPoints:
         torch.manual_seed(4)
         pts = nearest_e8(torch.randn(128, 8) * 2)
         assert distinct_points(pts.repeat(5, 1)) == distinct_points(pts)
+
+
+class TestStridedIndices:
+    def test_stays_in_bounds_past_the_float32_mantissa(self):
+        # 2**26 rows is what a pooled expert tensor actually has. torch.linspace is float32 and
+        # rounds the final index UP to n, gathering out of bounds — a device-side assert on CUDA.
+        n = 2 ** 26
+        sel = strided_indices(n, 8_000_000, torch.device("cpu"))
+        assert sel.numel() == 8_000_000
+        assert int(sel.max()) < n and int(sel.min()) >= 0
+        assert sel.dtype == torch.long
+
+    def test_returns_everything_when_k_exceeds_n(self):
+        assert torch.equal(strided_indices(50, 200, torch.device("cpu")), torch.arange(50))
+
+    def test_is_evenly_spaced_and_spans_the_axis(self):
+        sel = strided_indices(1000, 11, torch.device("cpu"))
+        assert int(sel[0]) == 0 and int(sel[-1]) == 999
+        assert len(set(torch.diff(sel).tolist())) <= 2      # even up to integer rounding
 
 
 class TestCalibrateScale:

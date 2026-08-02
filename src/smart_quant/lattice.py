@@ -75,6 +75,18 @@ def distinct_points(pts: torch.Tensor) -> int:
 HEADROOM = 4  # sub-vectors per addressable point before the fit degenerates into memorisation
 
 
+def strided_indices(n: int, k: int, device: torch.device) -> torch.Tensor:
+    """`k` evenly spaced indices into a length-`n` axis, in exact integer arithmetic.
+
+    `torch.linspace` returns float32, whose 24-bit mantissa cannot represent indices above 2**24.
+    A pooled expert tensor has ~67M sub-vectors, so the final index 2**26 - 1 rounds *up* to 2**26
+    and gathers out of bounds. `codebook.py` uses linspace safely only because it subsamples
+    per-expert, well under the limit."""
+    if k >= n:
+        return torch.arange(n, device=device)
+    return torch.arange(k, device=device, dtype=torch.long) * (n - 1) // (k - 1)
+
+
 def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
                     iters: int = 24, max_fit: int = 8_000_000) -> float:
     """Scale whose distinct-point count realizes `target_bpw`.
@@ -88,8 +100,7 @@ def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
     count above target, drives the scale to its floor, and hands back a near-lossless fit in which
     almost every sub-vector has its own code — memorisation, not quantisation, reported at a
     fictional rate. That degeneracy is exactly what invalidated an early 2^20 measurement."""
-    fit = (pool if pool.shape[0] <= max_fit else pool[
-        torch.linspace(0, pool.shape[0] - 1, max_fit, device=pool.device).round().long()]).float()
+    fit = pool[strided_indices(pool.shape[0], max_fit, pool.device)].float()
     target_points = 2.0 ** (target_bpw * sub_dim)
     if fit.shape[0] < HEADROOM * target_points:
         raise ValueError(
