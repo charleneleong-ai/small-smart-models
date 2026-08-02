@@ -117,19 +117,21 @@ compete here and should not claim to.
 
 ## Implications, ranked
 
-1. **Smaller `sub_dim`, more codebooks.** Two independent published results point this way, and the
-   intermediate-sharing axis is a one-line generalization of today's binary `share_codebook` flag.
-   Now the top candidate, since rotation did not survive its own check.
-2. **Take the fixed-codebook family seriously, or state why not.** The measurement above suggests our
-   negatives and the field's positives may both be right, separated by learned-vs-fixed codebooks.
-   That is a testable claim: a lattice or trellis quantizer *should* benefit from rotation where ours
-   does not. It is also a much larger build than anything attempted so far.
-3. **State the MoE disagreement.** Four negatives on non-uniform allocation, against a field trend
+1. **Entropy-coded or trellis quantization.** The one direction still open, and the one the field
+   converged on. Phase 9 showed a *fixed-rate* lattice loses outright; the mechanism it was missing
+   is entropy coding, which prices in the frequency non-uniformity that a structured code creates.
+   QTIP's trellis is this idea carried to its conclusion. The cost is a variable-length decoder.
+2. **State the MoE disagreement.** Four negatives on non-uniform allocation, against a field trend
    toward more of it, is a finding — but only if written as one.
-4. **Benchmark honestly against structured codebooks.** Our shared-codebook PQ is the unstructured
+3. **Benchmark honestly against structured codebooks.** Our shared-codebook PQ is the unstructured
    baseline; QTIP/QuIP# are what a strong 2-bit result looks like in 2026.
 
-**Not recommended:** incoherence processing on the current quantizer, per the measurement above.
+**Not recommended,** all three tried and measured:
+
+- **Incoherence processing** on the current quantizer — mu improves as advertised, the objective does not.
+- **Smaller `sub_dim` / more codebooks** — two published results point this way, but our own sweep
+  disagrees at our operating point: `d=2` is 8.5% worse and four books buy 1.3% for 3.7% more bpw.
+- **A fixed-rate lattice**, with or without rotation — see `docs/local-optimum.md`.
 
 ## Caveats on the cross-paper numbers
 
