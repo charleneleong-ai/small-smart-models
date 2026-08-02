@@ -52,18 +52,24 @@ def nearest_e8(x: torch.Tensor) -> torch.Tensor:
     return torch.where(closer.unsqueeze(1), a, b)
 
 
-def distinct_points(pts: torch.Tensor) -> int:
-    """Number of distinct lattice points, via an integer polynomial hash.
+def point_hash(pts: torch.Tensor) -> torch.Tensor:
+    """Collision-resistant int64 key per lattice point, so distinct counts can be accumulated
+    across chunks without holding every point in memory.
 
-    Coordinates are half-integers, so doubling makes them integral. `unique(dim=0)` over tens of
-    millions of rows is not viable; a 1-D unique over hashes is."""
+    Coordinates are half-integers, so doubling makes them integral. Horner form, deliberately
+    allowed to wrap: HASH_BASE**7 is ~1e32 and overflows int64, so a precomputed power vector is
+    not an option — wrapping makes this a polynomial hash mod 2**64."""
     key = (pts * 2).to(torch.int64)
-    # Horner form, deliberately allowed to wrap: HASH_BASE**7 is ~1e32 and overflows int64, so a
-    # precomputed power vector is not an option. Wrapping is a polynomial hash mod 2**64.
     h = torch.zeros(pts.shape[0], dtype=torch.int64, device=pts.device)
     for i in range(pts.shape[1]):
         h = h * HASH_BASE + key[:, i]
-    return int(torch.unique(h).numel())
+    return h
+
+
+def distinct_points(pts: torch.Tensor) -> int:
+    """Number of distinct lattice points. `unique(dim=0)` over tens of millions of rows is not
+    viable; a 1-D unique over hashes is."""
+    return int(torch.unique(point_hash(pts)).numel())
 
 
 HEADROOM = 4  # sub-vectors per addressable point before the fit degenerates into memorisation
@@ -82,8 +88,8 @@ def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
     count above target, drives the scale to its floor, and hands back a near-lossless fit in which
     almost every sub-vector has its own code — memorisation, not quantisation, reported at a
     fictional rate. That degeneracy is exactly what invalidated an early 2^20 measurement."""
-    fit = pool if pool.shape[0] <= max_fit else pool[
-        torch.linspace(0, pool.shape[0] - 1, max_fit).round().long()]
+    fit = (pool if pool.shape[0] <= max_fit else pool[
+        torch.linspace(0, pool.shape[0] - 1, max_fit, device=pool.device).round().long()]).float()
     target_points = 2.0 ** (target_bpw * sub_dim)
     if fit.shape[0] < HEADROOM * target_points:
         raise ValueError(
@@ -100,24 +106,34 @@ def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
     return (lo * hi) ** 0.5
 
 
-def quantize_e8_fused(weight: torch.Tensor, target_bpw: float,
-                      sub_dim: int = 8) -> tuple[float, int]:
+def quantize_e8_fused(weight: torch.Tensor, target_bpw: float, sub_dim: int = 8,
+                      chunk: int = 4_000_000) -> tuple[float, int]:
     """Fake-quantize a fused (num_experts, out, in) weight to the E8 lattice, in place.
 
     One scale serves the whole tensor: that is what the pooled measurement used, and it already
     beat 32 individually fitted per-expert k-means codebooks. Returns (realized_bits, n_weights)
     with **no codebook term** — lattice points are computed, so the only costs are the index and a
-    single fp16 scale."""
+    single fp16 scale.
+
+    Quantization runs in chunks. A real `gate_up_proj` holds ~67M sub-vectors, and rounding them
+    all at once builds >10 GB of temporaries on top of a 67 GB model — the shape of failure that
+    OOM'd Phase 8. Chunking is exact: sub-vectors are independent given the tensor's single
+    scale."""
     if sub_dim != 8:
         raise ValueError("E8 is defined for sub_dim=8")
     if weight.shape[-1] % sub_dim:
         raise ValueError(f"in_features {weight.shape[-1]} not divisible by sub_dim {sub_dim}")
 
-    pool = weight.reshape(-1, sub_dim).float()
+    pool = weight.reshape(-1, sub_dim)          # a view: writes land back in `weight`
     scale = calibrate_scale(pool, target_bpw, sub_dim)
-    pts = nearest_e8(pool / scale)
-    weight.copy_((pts * scale).reshape(weight.shape).to(weight.dtype))
 
-    index_bits = math.ceil(math.log2(max(distinct_points(pts), 2)))
+    hashes = []
+    for i in range(0, pool.shape[0], chunk):
+        pts = nearest_e8(pool[i:i + chunk].float() / scale)
+        pool[i:i + chunk] = (pts * scale).to(weight.dtype)
+        hashes.append(point_hash(pts))
+    distinct = int(torch.unique(torch.cat(hashes)).numel())
+
+    index_bits = math.ceil(math.log2(max(distinct, 2)))
     n_weights = weight.numel()
     return index_bits * (n_weights / sub_dim) + 16, n_weights

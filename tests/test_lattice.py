@@ -102,6 +102,17 @@ class TestQuantizeE8Fused:
         quantize_e8_fused(hi, target_bpw=1.25)
         assert (hi - base).pow(2).mean() < (lo - base).pow(2).mean()
 
+    def test_chunking_is_exact(self):
+        # sub-vectors are independent given the tensor's single scale, so the chunk size bounds
+        # memory without changing results — the fix Phase 8 needed after its OOM
+        torch.manual_seed(10)
+        base = torch.randn(8, 64, 128) * 0.01
+        whole, chunked = base.clone(), base.clone()
+        r_whole = quantize_e8_fused(whole, target_bpw=1.0, chunk=10 ** 9)
+        r_chunk = quantize_e8_fused(chunked, target_bpw=1.0, chunk=777)
+        assert torch.equal(whole, chunked)
+        assert r_whole == r_chunk
+
     @pytest.mark.parametrize("shape,sub_dim", [((1, 8, 20), 8), ((1, 8, 16), 4)])
     def test_rejects_bad_geometry(self, shape, sub_dim):
         with pytest.raises(ValueError):
