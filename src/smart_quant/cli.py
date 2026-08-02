@@ -81,6 +81,9 @@ def encode_eval(
     bits_lo: float = typer.Option(1.5, help="Min per-expert bits (expert allocation)."),
     bits_hi: float = typer.Option(3.0, help="Max per-expert bits (expert allocation)."),
     freqs_path: Path = typer.Option(Path("experiments/bits-per-brain/expert_freq.pt")),
+    lattice: bool = typer.Option(
+        False, help="Quantize to the E8 lattice instead of a learned codebook. --avg-bits then "
+                    "acts as a target rate realized by per-tensor scale calibration."),
     importance_path: Path | None = typer.Option(
         None, help="Activation importance .pt from profile-activations."),
     hessian_path: Path | None = typer.Option(
@@ -111,7 +114,7 @@ def encode_eval(
     freqs = torch.load(freqs_path, weights_only=True) if allocation == "expert" else None
     importance = torch.load(importance_path, weights_only=True) if importance_path else None
     hessians = torch.load(hessian_path, weights_only=True) if hessian_path else None
-    stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs,
+    stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs, lattice=lattice,
                              bits_lo=bits_lo, bits_hi=bits_hi, codebook_order=codebook_order,
                              importance=importance, hessians=hessians, rounds=rounds,
                              compensate=compensate)
@@ -128,7 +131,8 @@ def encode_eval(
     ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
 
     row = {"label": label, "model": model, "allocation": allocation, "avg_bits": avg_bits,
-           "sub_dim": sub_dim, "codebook_order": codebook_order,
+           "sub_dim": 8 if lattice else sub_dim, "codebook_order": codebook_order,
+           "quantizer": "e8" if lattice else "pq",
            # derived from the artifact's rank, not a hand-typed flag: a mislabeled row would put
            # a data point on the wrong arm of the phase-7 ablation
            "importance": None if importance is None else (
