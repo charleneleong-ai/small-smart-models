@@ -136,7 +136,11 @@ def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
                 lo = mid
             else:
                 hi = mid
-    return (lo * hi) ** 0.5
+    # Return the coarse end of the bracket, never the midpoint. `hi` is the side that satisfies
+    # distinct <= target, so ceil(log2(distinct)) cannot exceed the requested bit width. The
+    # midpoint can land just above 2**20 and silently cost a whole extra bit — 2.625 instead of
+    # 2.5 — which would break the matched-footprint comparison the phase rests on.
+    return hi
 
 
 def quantize_e8_fused(weight: torch.Tensor, target_bpw: float, sub_dim: int = 8,

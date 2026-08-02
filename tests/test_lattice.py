@@ -84,6 +84,16 @@ class TestCalibrateScale:
         rate = math.ceil(math.log2(distinct_points(nearest_e8(pool / s)))) / 8
         assert abs(rate - 1.5) <= 0.125          # one bit of index granularity
 
+    def test_never_overshoots_the_target(self):
+        # the realized rate must not exceed what was asked: an extra bit is 0.125 bpw, enough to
+        # void a matched-footprint comparison
+        torch.manual_seed(11)
+        pool = torch.randn(200_000, 8) * 0.01
+        for target in (1.0, 1.25, 1.5):
+            s = calibrate_scale(pool, target_bpw=target)
+            rate = math.ceil(math.log2(distinct_points(nearest_e8(pool / s)))) / 8
+            assert rate <= target + 1e-9, f"{target} bpw realized as {rate}"
+
     def test_coarser_scale_gives_fewer_points(self):
         # monotonicity is exactly what makes the bisection valid
         torch.manual_seed(6)
