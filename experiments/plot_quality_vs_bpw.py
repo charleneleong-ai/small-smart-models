@@ -44,6 +44,7 @@ FAMILIES = (
     Family("rvq", "#7c3aed", "#5b21b6", "residual codebook PQ (2-stage)", (6, -14)),
     Family("wpq", "#0d9488", "#115e59", "activation-weighted PQ", (-9, 5)),
     Family("gptq", "#ea580c", "#9a3412", "GPTQ error compensation", (6, 8)),
+    Family("e8", "#be123c", "#881337", "E8 lattice (fixed-width)", (-9, -14)),
 )
 
 # Ablation runs share a footprint with the main arm of their family (Phase-7's alpha sweep,

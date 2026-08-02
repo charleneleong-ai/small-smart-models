@@ -376,6 +376,53 @@ architecture, at this bit range, a shared codebook fit by plain k-means is a har
 still what beats imatrix by 3.2 pp. Design:
 [`docs/specs/2026-07-31-gptq-compensation-phase8-design.md`](../specs/2026-07-31-gptq-compensation-phase8-design.md).
 
+### Phase 9 — E8 lattice quantization
+
+[Nine measurements](../local-optimum.md) said uniform shared-codebook PQ is a strong local optimum,
+and the one apparent exit was a lattice: a stored codebook costs `O(2^{kd}·d)` to keep *and* search,
+while a lattice computes its points, making `sub_dim=8` reachable at zero storage. Phase 9 built E8
+— the densest 8-dimensional sphere packing, and what QuIP# uses — and ran it end to end.
+
+| footprint | uniform PQ | E8 lattice | gap |
+|---|---|---|---|
+| ~2.0 bpw | `pq2` 6.765 | `e8-20` (2.000) **8.6827** | **−1.918** |
+| ~2.5 bpw | `pq25` (2.542) 6.2137 | `e8-25` (2.500) **6.4607** | **−0.247** |
+
+**Verdict — negative, and the widening gap is the diagnostic.** A learned codebook earns *shape
+gain*: it puts centroids where the data actually is. A lattice is a fixed regular grid whose only
+advantage is *space-filling gain*, bounded for E8 at ~0.65 dB. Weights are roughly Gaussian —
+concentrated near zero — so uniform-density lattice points are badly matched to them, and the
+mismatch costs more as the rate falls. Hence −0.247 at 2.5 bpw and −1.918 at 2.0.
+
+**Rotation does not rescue it.** QuIP# pairs its lattice with incoherence processing, so the obvious
+reading was that Phase 9 tested half a method. Measured on 64 experts, a random-sign Hadamard buys
+**0.5% at 2.5 bpw and 1.4% at 2.0** — against gaps of 8% and 49%. Incoherence processing addresses
+*anisotropy*; it makes the distribution rounder but no less peaked, and the Gaussian-versus-uniform
+mismatch is untouched.
+
+### What the lattice actually needs: entropy coding
+
+The first measurement of E8, before any encode, showed it **2.3× better** on reconstruction. That
+used an ideal entropy-coded rate, and it was discarded as unfair to fixed-width k-means. That
+dismissal was wrong in an instructive way — it was not unfair, it was measuring a *different system*:
+
+- Lattice codes are uniform in space and therefore **highly non-uniform in frequency**, so entropy
+  coding recovers exactly the shape gain that fixed-width indexing discards.
+- k-means codes are already near-uniform (measured entropy 9.90–9.93 of 10 bits), so entropy coding
+  buys them essentially nothing.
+
+So the honest statement is narrower and more useful than "the lattice loses":
+
+> A lattice's advantage over a learned codebook is real, but **only realizable with entropy coding**.
+> Under fixed-width indexing — what this study and most deployments use — the learned codebook's
+> shape gain dominates, increasingly so as the rate falls.
+
+That is why QTIP uses *trellis* coding rather than a raw lattice shell, and it explains the whole arc
+of this measurement (2.3× → 16% → ~10% → negative): every "correction" removed the entropy coding,
+and the entropy coding was the mechanism.
+
+Design: [`docs/specs/2026-08-01-e8-lattice-phase9-design.md`](../specs/2026-08-01-e8-lattice-phase9-design.md).
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)
