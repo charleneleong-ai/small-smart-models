@@ -87,8 +87,16 @@ def strided_indices(n: int, k: int, device: torch.device) -> torch.Tensor:
     return torch.arange(k, device=device, dtype=torch.long) * (n - 1) // (k - 1)
 
 
+def distinct_at_scale(pool: torch.Tensor, scale: float, chunk: int = 4_000_000) -> int:
+    """Distinct lattice points over the whole pool at `scale`, chunked so a 67M-row tensor does
+    not build its rounding temporaries all at once."""
+    hashes = [point_hash(nearest_e8(pool[i:i + chunk].float() / scale))
+              for i in range(0, pool.shape[0], chunk)]
+    return int(torch.unique(torch.cat(hashes)).numel())
+
+
 def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
-                    iters: int = 24, max_fit: int = 8_000_000) -> float:
+                    iters: int = 24, max_fit: int = 8_000_000, refine: int = 8) -> float:
     """Scale whose distinct-point count realizes `target_bpw`.
 
     Distinct count decreases monotonically as the scale coarsens, so bisection converges — in the
@@ -100,13 +108,14 @@ def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
     count above target, drives the scale to its floor, and hands back a near-lossless fit in which
     almost every sub-vector has its own code — memorisation, not quantisation, reported at a
     fictional rate. That degeneracy is exactly what invalidated an early 2^20 measurement."""
-    fit = pool[strided_indices(pool.shape[0], max_fit, pool.device)].float()
     target_points = 2.0 ** (target_bpw * sub_dim)
-    if fit.shape[0] < HEADROOM * target_points:
+    if pool.shape[0] < HEADROOM * target_points:
         raise ValueError(
-            f"{fit.shape[0]} sub-vectors cannot realize {target_bpw} bpw: that needs "
+            f"{pool.shape[0]} sub-vectors cannot realize {target_bpw} bpw: that needs "
             f"{target_points:.0f} addressable points and at least {HEADROOM}x as many "
-            f"sub-vectors. Raise max_fit, or use a larger tensor.")
+            f"sub-vectors. Use a larger tensor or a lower target.")
+
+    fit = pool[strided_indices(pool.shape[0], max_fit, pool.device)].float()
     lo, hi = 1e-5, 1.0
     for _ in range(iters):
         mid = (lo * hi) ** 0.5
@@ -114,6 +123,19 @@ def calibrate_scale(pool: torch.Tensor, target_bpw: float, sub_dim: int = 8,
             lo = mid
         else:
             hi = mid
+
+    if refine and fit.shape[0] < pool.shape[0]:
+        # A subsample systematically undercounts distinct points, so the coarse scale realizes a
+        # *higher* rate than asked — 2.75 against a 2.5 target on a real tensor. Re-bisect against
+        # the full pool inside a widened bracket. Matched footprint is the comparison's whole
+        # basis, so paying a few seconds here is cheaper than a mismatched encode.
+        lo, hi = lo * 0.5, hi * 2.0
+        for _ in range(refine):
+            mid = (lo * hi) ** 0.5
+            if distinct_at_scale(pool, mid) > target_points:
+                lo = mid
+            else:
+                hi = mid
     return (lo * hi) ** 0.5
 
 
