@@ -2,8 +2,9 @@ import pytest
 import torch
 from torch import nn
 
+from conftest import TinyExperts, wrap_in_layers
 from smart_quant.expert_importance import (
-    ActivationImportanceProfiler, ExpertUsageProfiler, bits_from_frequency,
+    ActivationImportanceProfiler, ExpertUsageProfiler, HessianProfiler, bits_from_frequency,
     normalize_importance, shrink_importance)
 
 HIDDEN = 8
@@ -83,22 +84,6 @@ class TestRouterSelection:
             model(torch.rand(TOKENS, HIDDEN))
         for freq in prof.frequencies().values():
             assert freq.sum() == pytest.approx(1.0, abs=1e-5)
-
-
-class TinyExperts(nn.Module):
-    """Mirrors the transformers-5 fused Experts contract the profiler hooks: fused
-    (num_experts, out, in) params and a forward taking the routing."""
-
-    def __init__(self, num_experts: int = 4, hidden: int = 8, inter: int = 4):
-        super().__init__()
-        self.num_experts = num_experts
-        self.hidden = hidden
-        self.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * inter, hidden) * 0.1)
-        self.down_proj = nn.Parameter(torch.randn(num_experts, hidden, inter) * 0.1)
-        self.act_fn = nn.SiLU()
-
-    def forward(self, hidden_states, top_k_index, top_k_weights):
-        return torch.zeros_like(hidden_states)
 
 
 class TestShrinkImportance:
@@ -206,3 +191,30 @@ class TestBitAllocation:
     def test_infeasible_target_clamped_to_bound(self):
         freq = torch.full((NUM_EXPERTS,), 1.0 / NUM_EXPERTS)
         assert bits_from_frequency(freq, avg_bits=5.0).min().item() == pytest.approx(3.0)
+
+
+class TestHessianProfiler:
+    def test_accumulates_the_input_second_moment_per_layer(self):
+        torch.manual_seed(0)
+        experts = TinyExperts()
+        model = wrap_in_layers(experts, prefix_depth=1)
+        x = torch.randn(12, 8)
+        with HessianProfiler(model) as prof:
+            model.inner.layers[0].mlp.experts(
+                x, torch.zeros(12, 1, dtype=torch.long), torch.ones(12, 1))
+        h = prof.hessians()[0]
+        assert h.shape == (8, 8)
+        assert torch.allclose(h, x.T @ x / 12, atol=1e-5)
+
+    def test_keys_are_layer_indices_not_module_paths(self):
+        model = wrap_in_layers(TinyExperts(), prefix_depth=2)
+        with HessianProfiler(model) as prof:
+            model.inner.inner.layers[0].mlp.experts(
+                torch.randn(4, 8), torch.zeros(4, 1, dtype=torch.long), torch.ones(4, 1))
+        assert list(prof.hessians()) == [0]
+
+    def test_hooks_removed_on_exit(self):
+        experts = TinyExperts()
+        with HessianProfiler(wrap_in_layers(experts)) as prof:
+            pass
+        assert prof.handles == [] and not experts._forward_pre_hooks
