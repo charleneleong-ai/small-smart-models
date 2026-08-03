@@ -1,21 +1,23 @@
-# Uniform shared-codebook PQ is a strong local optimum
+# Uniform shared-codebook PQ is a strong local optimum — with one measured exception
 
 **Date:** 2026-08-01 · **Model:** Qwen3.6-35B-A3B, routed expert FFNs, ~2.0–2.5 bpw
 
-Eleven measurements now bear on one question: can anything beat plain uniform product quantization
-with a single learned codebook per expert at `sub_dim=4`? All eleven say no. The tenth — swapping the
+Twelve measurements bear on one question: can anything beat plain uniform product quantization
+with a single learned codebook per expert at `sub_dim=4`? Eleven say no. The tenth — swapping the
 learned codebook for a **lattice** — looked like an escape under a reconstruction proxy and was
 refuted by the encode that followed. The eleventh closes the direction that one pointed at, before
-any of it was built.
+any of it was built. The twelfth returns to the first and finds its negative was a footprint
+artifact: at a genuinely matched footprint, usage allocation is a **small win** — the one measured
+exception to the local optimum.
 
 This note consolidates them, because four scattered negative phases read as bad luck while eleven
 aligned measurements read as a result.
 
-## The eleven that found nothing
+## The twelve measurements
 
 | # | what was tried | measured outcome |
 |---|---|---|
-| 1 | **Expert-level bit allocation** (Ph 3) | `pq2-expert` 7.68 vs `pq2-uniform` 6.77 — badly worse |
+| 1 | **Expert-level bit allocation** (Ph 3) | `pq2-expert` 7.68 vs `pq2-uniform` 6.77 *looked* like a loss; at true matched footprint `pq2-expert-storage` 6.61 is a **−2.3% win** (see #12) |
 | 2 | **Second-order residual codebooks** (Ph 6a) | `rvq25` 6.54 vs `pq25` 6.21; `rvq20` 7.45 vs 6.77 |
 | 3 | **Activation weighting** (Ph 7) | `wpq25` 6.2325 vs 6.2137; alpha sweep 0.25→1.0 never reaches baseline |
 | 4 | **GPTQ error compensation** (Ph 8) | `gptq25` 6.2400 vs 6.2137 — *actively harmful*, ~3% codebook drift |
@@ -26,16 +28,38 @@ aligned measurements read as a result.
 | 9 | **Codebook shape** (`sub_dim` × n_books) | shipped `d=4, k=1024, 1 book` wins; `d=2` 8.5% worse; 4 books buys 1.3% for 3.7% more bpw |
 | 10 | **E8 lattice** (Ph 9) | `e8-25` 6.4607 vs 6.2137; `e8-20` **8.6827** vs 6.765 — loses, and the gap widens as rate falls |
 | 11 | **Zero-storage codebook** (Ph 10) | learned-vs-drawn gap **widens** 13.4% → 21.2% as k grows 256 → 16384 — the trellis premise fails |
+| 12 | **Allocation mechanism 2×2** | reconstruction probe: water-fill helps scalar (−3.6%), slightly hurts PQ (+1.0%); the corrected encode flips PQ to a **−2.3% ppl win** — Phase 3's negative was footprint end to end |
 
-Five of these are full end-to-end encodes with perplexity at matched footprint (1–4, 10); the rest
-are direct measurements on real expert tensors.
+Six of these are full end-to-end encodes with perplexity (1–4, 10, plus the corrected
+`pq2-expert-storage` row); the rest are direct measurements on real expert tensors.
+
+### #12 corrected the first measurement
+
+The 2×2 ([`experiments/diagnose_allocation_2x2.py`](experiments/diagnose_allocation_2x2.py),
+[writeup](allocation-2x2-diagnosis.md)) ran the usage water-fill against both quantizer families
+on real layer-13 weights. Two findings. First, `bits_from_frequency` pins the *usage-weighted* mean,
+which is not the storage cost — with real routing skew the aggressive Phase-3 allocation realized
+**1.63 bpw**, not 2.0, so `7.68 vs 6.77` was a smaller-tensor score, and the
+"monotone in allocation strength" pattern is exactly what footprint drift produces. Second, with a
+true arithmetic-footprint-matched allocation the reconstruction probe shows the predicted
+mechanism — the water-fill helps a rate-limited scalar family (−3.6%) and slightly hurts the
+fit-limited PQ (+1.0%).
+
+The corrected end-to-end encode resolved the tension. Re-centred so the *storage* mean is 2.0 bpw,
+`pq2-expert-storage` scores **6.607 vs 6.765** at ~2.099 realized bpw — allocation is a free win,
+and the confounded 7.68/7.07 were entirely footprint. The probe's PQ sign failed to transfer
+because it sampled rows uniformly, which cannot see that ppl rewards the *routed* experts. The
+field's allocations help because they hold their byte budget fixed; the study's original water-fill
+did not.
 
 ## Why they all fail, in one sentence
 
-Every one of #1–#4 **reallocates capacity inside a fixed structure**, and #5–#9 show that structure
+Every one of #2–#4 **reallocates capacity inside a fixed structure**, and #5–#9 show that structure
 is already close to its own ceiling: the fit is within ~2% of what much harder fitting achieves,
 utilization is complete, the shape is optimal among reachable ones, and the two preprocessing tricks
-that work elsewhere (rescaling, rotation) have nothing to grip here.
+that work elsewhere (rescaling, rotation) have nothing to grip here. #1 — the one that reallocates
+*across* experts rather than within a tensor — is the exception, and only once its byte budget was
+held fixed (see #12).
 
 Two results sharpen it further. Phase 7's post-mortem showed `E[x²]` **is** the layerwise Hessian
 diagonal and is *anti*-correlated with where PQ errs — so reweighting by any diagonal is closed, not
