@@ -171,22 +171,31 @@ class TestBitAllocation:
         order = freq.argsort()
         assert torch.all(torch.diff(bits[order]) >= -1e-6)
 
-    def test_weighted_mean_hits_target_without_clamp(self):
+    def test_storage_mean_hits_target_without_clamp(self):
         # Uniform usage + avg at the [lo,hi] midpoint → rescale is a no-op, no clamping.
         freq = torch.full((NUM_EXPERTS,), 1.0 / NUM_EXPERTS)
         bits = bits_from_frequency(freq, avg_bits=2.25, lo=1.5, hi=3.0)
-        weighted_mean = (bits * freq).sum() / freq.sum()
-        assert weighted_mean.item() == pytest.approx(2.25, abs=1e-4)
+        assert bits.mean().item() == pytest.approx(2.25, abs=1e-4)
 
-    def test_weighted_mean_holds_under_skew(self):
-        # The case the old rescale-then-clamp got wrong: heavy skew forces clamping, yet
-        # the usage-weighted mean must still land exactly on target.
+    def test_storage_mean_holds_under_skew(self):
+        # The Phase-3 case: heavy skew forces clamping, and the storage (arithmetic) mean must
+        # still land exactly on target — the usage-weighted one silently drifts below.
         torch.manual_seed(1)
         freq = torch.rand(NUM_EXPERTS) ** 3
         freq = freq / freq.sum()
         bits = bits_from_frequency(freq, avg_bits=2.5, lo=1.5, hi=3.0)
         assert bits.min() >= 1.5 and bits.max() <= 3.0
+        assert bits.mean().item() == pytest.approx(2.5, abs=1e-4)
+
+    def test_usage_centered_opt_in_keeps_weighted_mean(self):
+        # storage_centered=False reproduces the pre-fix contract: the usage-weighted mean hits
+        # target while the storage mean drifts below — the artifact the default now prevents.
+        torch.manual_seed(1)
+        freq = torch.rand(NUM_EXPERTS) ** 3
+        freq = freq / freq.sum()
+        bits = bits_from_frequency(freq, avg_bits=2.5, lo=1.5, hi=3.0, storage_centered=False)
         assert ((bits * freq).sum()).item() == pytest.approx(2.5, abs=1e-4)
+        assert bits.mean().item() < 2.5
 
     def test_infeasible_target_clamped_to_bound(self):
         freq = torch.full((NUM_EXPERTS,), 1.0 / NUM_EXPERTS)
