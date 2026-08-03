@@ -114,7 +114,7 @@ def main(
     freqs = load_freq(freq, layer, n_experts)
     fits = [w[e][0::2].reshape(-1, SUB_DIM) for e in range(n_experts)]
     evals = [w[e][1::2].reshape(-1, SUB_DIM) for e in range(n_experts)]
-    raw = bits_from_frequency(freqs, avg_bits, lo=lo, hi=hi)
+    raw = bits_from_frequency(freqs, avg_bits, lo=lo, hi=hi, storage_centered=False)
     alloc = footprint_match(raw, avg_bits, lo, hi)
     uniform = torch.full((n_experts,), float(avg_bits))
 
