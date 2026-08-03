@@ -81,7 +81,7 @@ def arm_a(weights: torch.Tensor, grams: torch.Tensor, counts: torch.Tensor,
                         / max((w @ g * w).sum().item(), 1e-12))
         routed_errs.append(err)
     n = counts.float().clamp(min=1e-12)
-    routed = float((n * torch.tensor(routed_errs)).sum() / n.sum())
+    routed = float((n * torch.tensor(routed_errs, device=n.device)).sum() / n.sum())
     return proxy, routed, routed_errs
 
 
