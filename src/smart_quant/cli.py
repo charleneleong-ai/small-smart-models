@@ -46,15 +46,21 @@ def eval_model(
     config: str = typer.Option("wikitext-2-raw-v1", help="Dataset config."),
     max_length: int = typer.Option(4096),
     stride: int = typer.Option(2048),
+    tasks: str = typer.Option(None, help="Comma-separated lm-eval tasks for the capability "
+                                         "battery (e.g. arc_challenge,gsm8k); appends task_acc."),
+    limit: int = typer.Option(None, help="Per-task sample limit for the battery (None = full)."),
     out: Path = typer.Option(Path("experiments/bits-per-brain/results.jsonl")),
 ) -> None:
-    """Sliding-window wikitext perplexity for one model; append a row to results.jsonl."""
+    """Sliding-window wikitext perplexity for one model; append a row to results.jsonl.
+
+    With --tasks, also runs the lm-eval capability battery on the same in-memory model and
+    appends `task_acc` to the row — the footprint-matched artifact its ppl came from."""
     import json
 
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    from smart_quant.eval import load_causal_lm, sliding_window_perplexity
+    from smart_quant.eval import load_causal_lm, run_task_battery, sliding_window_perplexity
 
     # dataset first, so a bad id fails fast rather than after the multi-minute model load
     # A GGUF repo's own tokenizer is not necessarily byte-identical to the base model's, and
@@ -70,9 +76,15 @@ def eval_model(
     lm = load_causal_lm(model, **load_kwargs).eval()
     ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
 
+    task_acc = None
+    if tasks:
+        task_acc = run_task_battery(lm, tok, [t.strip() for t in tasks.split(",")], limit)
+
     row = {"label": label, "model": model, "gguf_file": gguf_file,
            "tokenizer": tokenizer or model, "wikitext_ppl": round(ppl, 4),
            "dataset": f"{dataset}:{config}"}
+    if task_acc:
+        row["task_acc"] = task_acc
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("a") as f:
         f.write(json.dumps(row) + "\n")
@@ -103,10 +115,16 @@ def encode_eval(
     config: str = typer.Option("wikitext-2-raw-v1"),
     max_length: int = typer.Option(4096),
     stride: int = typer.Option(2048),
+    tasks: str = typer.Option(None, help="Comma-separated lm-eval tasks for the capability "
+                                         "battery (e.g. arc_challenge,gsm8k); appends task_acc."),
+    limit: int = typer.Option(None, help="Per-task sample limit for the battery (None = full)."),
     out: Path = typer.Option(Path("experiments/bits-per-brain/results.jsonl")),
 ) -> None:
     """Fake-quantize the expert FFNs (uniform or expert-importance allocation), then measure
-    wikitext perplexity; append a row to results.jsonl."""
+    wikitext perplexity; append a row to results.jsonl.
+
+    With --tasks, also runs the lm-eval capability battery on the quantized model in memory —
+    task accuracy is the "still smart" half of the footprint-matched claim."""
     import json
 
     import torch
@@ -114,7 +132,7 @@ def encode_eval(
     from transformers import AutoTokenizer
 
     from smart_quant.encode import quantize_experts
-    from smart_quant.eval import load_causal_lm, sliding_window_perplexity
+    from smart_quant.eval import load_causal_lm, run_task_battery, sliding_window_perplexity
 
     # dataset first, so a bad id fails fast rather than after the multi-minute model load
     tok = AutoTokenizer.from_pretrained(model)
@@ -139,6 +157,10 @@ def encode_eval(
     model_bpw = (expert_bits + (total_params - expert_weights) * 16) / total_params
     ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
 
+    task_acc = None
+    if tasks:
+        task_acc = run_task_battery(lm, tok, [t.strip() for t in tasks.split(",")], limit)
+
     row = {"label": label, "model": model, "allocation": allocation, "avg_bits": avg_bits,
            "sub_dim": 8 if lattice else sub_dim, "codebook_order": codebook_order,
            "quantizer": "e8" if lattice else "pq",
@@ -151,6 +173,8 @@ def encode_eval(
            "wikitext_ppl": round(ppl, 4), "moe_layers": len(stats),
            "per_expert_bits_span": span, "expert_bpw": round(expert_bpw, 3),
            "model_bpw": round(model_bpw, 3)}
+    if task_acc:
+        row["task_acc"] = task_acc
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("a") as f:
         f.write(json.dumps(row) + "\n")

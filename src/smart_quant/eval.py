@@ -72,3 +72,53 @@ def run_lm_eval(
         cmd += ["--limit", str(limit)]
     subprocess.run(cmd, check=True)
     return out_dir
+
+
+# Capability battery: reasoning, two commonsense axes, math, broad knowledge. All leaf eval on
+# a 35B (or grouped, `mmlu` aggregates to one number), small enough to afford on every build row.
+CAPABILITY_BATTERY = ("arc_challenge", "hellaswag", "winogrande", "gsm8k", "mmlu")
+_METRIC_PRIORITY = ("acc_norm", "acc", "exact_match", "strict_match", "pass@1")
+
+
+def primary_accuracy(metrics: dict[str, float]) -> float:
+    """Headline accuracy for a task from an lm-eval per-task metric dict.
+
+    Multiple-choice tasks report `acc` / `acc_norm` (HellaSwag-style continuations list both),
+    generation tasks `exact_match` / `strict_match`, code tasks `pass@1`. lm-eval 0.4 keys the
+    dict `metric,aggregation`, so the bare metric is the part before the comma; `_stderr` keys
+    are skipped by exact matching on that bare name. The priority picks the length-normalized
+    multiple-choice number where both exist, and is what `mmlu`'s group aggregate resolves
+    through too."""
+    for metric in _METRIC_PRIORITY:
+        key = next((k for k in metrics if k.split(",")[0] == metric), None)
+        if key is not None:
+            return round(float(metrics[key]), 4)
+    raise KeyError(f"no known accuracy metric in {sorted(metrics)}")
+
+
+def run_task_battery(
+    model,
+    tokenizer,
+    tasks: list[str] | None = None,
+    limit: int | None = None,
+) -> dict[str, float]:
+    """lm-eval task accuracy against an already-loaded (e.g. fake-quantized) model, in memory.
+
+    The model never round-trips to disk — that is what lets a 2-bit build be scored on the same
+    artifact its perplexity row came from. Returns `{task: headline accuracy}`; a grouped task
+    like `mmlu` resolves to its aggregated entry in `results["results"]`. The lm_eval import is
+    lazy so this module stays importable in CI, which installs only torch."""
+    from lm_eval import simple_evaluate
+    from lm_eval.models.huggingface import HFLM
+
+    requested = set(tasks or CAPABILITY_BATTERY)
+    results = simple_evaluate(
+        model=HFLM(pretrained=model, tokenizer=tokenizer),
+        tasks=sorted(requested),
+        limit=limit,
+        confirm_run_unsafe_code=True,
+    )
+    if results is None:
+        raise RuntimeError("lm-eval returned no results — task load failed")
+    return {name: primary_accuracy(metrics)
+            for name, metrics in results["results"].items() if name in requested}
