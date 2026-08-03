@@ -423,6 +423,39 @@ and the entropy coding was the mechanism.
 
 Design: [`docs/specs/2026-08-01-e8-lattice-phase9-design.md`](../specs/2026-08-01-e8-lattice-phase9-design.md).
 
+## Capability battery — the "smart" half of the claim
+
+Every number so far is wikitext-2 perplexity (or reconstruction error): it tells us how
+much the *token distribution* degrades, not whether the model stops *being smart*. The
+study's question is "small while staying smart", and `run_task_battery`
+([`src/smart_quant/eval.py`](../../src/smart_quant/eval.py)) closes that gap — lm-eval task
+accuracy against the same in-memory fake-quantized artifact its ppl row came from, no
+checkpoint round-trip.
+
+The battery — `arc_challenge` (reasoning), `hellaswag` + `winogrande` (two commonsense
+axes), `gsm8k` (math, generation), `mmlu` (broad knowledge, grouped aggregate) — is small
+enough to afford on every build row, and every metric resolves through
+[`primary_accuracy`](../../src/smart_quant/eval.py) (acc_norm > acc > exact_match).
+
+Scope: score fp16 (baseline), the shipped `pq25-uniform` / `pq20-uniform`, the two
+negatives that matter most (`e8-25`, `gptq25`), and the `iq2_m` imatrix GGUF — all at
+matched footprint, one task row per build. The questions: does 2.5 bpw PQ keep most of
+the task accuracy while losing 0.3 ppl? Do the ppl-negative methods (E8, GPTQ) recover
+or amplify on capability? Cross-paper capability numbers at 2-bit don't exist; this is the
+controlled version of that comparison.
+
+Run on the GPU box, one detached daemon per build (verified `PPID=1`):
+
+```bash
+setsid nohup uv run smart-quant encode-eval --model Qwen/Qwen3.6-35B-A3B \
+  --label pq25-uniform --avg-bits 2.5 \
+  --tasks arc_challenge,hellaswag,winogrande,gsm8k,mmlu --limit 200 \
+  </dev/null >>logs/cap_pq25_$(date -u +%Y%m%dT%H%M%SZ).log 2>&1 & disown
+```
+
+`--limit` keeps each run ~1-2 GPU-hours and is identical across rows so the samples being
+scored match. fp16 / GGUF baselines use the same `--tasks` on the `eval` command.
+
 ## Phases
 
 1. **Baselines** — load fp16, run eval harness; pull + eval UD-IQ2_M and AWQ-4bit. (fits 80 GB)
