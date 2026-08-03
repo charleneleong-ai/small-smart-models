@@ -39,6 +39,9 @@ def eval_model(
     model: str = typer.Option(..., help="HF repo id or local path."),
     label: str = typer.Option(..., help="Row label, e.g. fp16 / iq2_m / vptq-2bit."),
     gguf_file: str = typer.Option(None, help="GGUF filename within the repo (dequantized load)."),
+    tokenizer: str = typer.Option(None, help="Tokenizer repo id; defaults to --model. Point this at "
+                                             "the fp16 base when evaluating a GGUF so the token "
+                                             "count matches every other row in results.jsonl."),
     dataset: str = typer.Option("Salesforce/wikitext", help="HF dataset repo id."),
     config: str = typer.Option("wikitext-2-raw-v1", help="Dataset config."),
     max_length: int = typer.Option(4096),
@@ -54,16 +57,22 @@ def eval_model(
     from smart_quant.eval import load_causal_lm, sliding_window_perplexity
 
     # dataset first, so a bad id fails fast rather than after the multi-minute model load
-    tok = AutoTokenizer.from_pretrained(model)
+    # A GGUF repo's own tokenizer is not necessarily byte-identical to the base model's, and
+    # perplexity is only comparable across rows when the token count is. Default to --model so
+    # existing calls are unchanged; override to the fp16 base when scoring a GGUF.
+    tok = AutoTokenizer.from_pretrained(tokenizer or model)
     text = "\n\n".join(load_dataset(dataset, config, split="test")["text"])
     load_kwargs = {"dtype": "auto", "device_map": "cuda"}
     if gguf_file:
-        load_kwargs["gguf_file"] = gguf_file
+        # GGUF is dequantized on load, so a 35B build lands at ~70 GB in fp16 — close enough to an
+        # 80 GB card that "auto" should be free to spill rather than OOM. fp32 would not fit at all.
+        load_kwargs |= {"gguf_file": gguf_file, "dtype": "float16", "device_map": "auto"}
     lm = load_causal_lm(model, **load_kwargs).eval()
     ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
 
     row = {"label": label, "model": model, "gguf_file": gguf_file,
-           "wikitext_ppl": round(ppl, 4), "dataset": f"{dataset}:{config}"}
+           "tokenizer": tokenizer or model, "wikitext_ppl": round(ppl, 4),
+           "dataset": f"{dataset}:{config}"}
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("a") as f:
         f.write(json.dumps(row) + "\n")
