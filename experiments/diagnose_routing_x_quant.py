@@ -53,16 +53,21 @@ def rel_err(recon: torch.Tensor, ref: torch.Tensor) -> float:
     return float((recon - ref).norm() / ref.norm())
 
 
-def fit_book(pool: torch.Tensor, bits: float) -> torch.Tensor:
-    """Shared-codebook Lloyd fit matching the shipped encode: k = centroids_for_bits, iters=10,
-    max_fit=max(4096, k*8) strided sampling over the given sub-vector pool."""
-    k = centroids_for_bits(bits, SUB_DIM)
+def fit_book(pool: torch.Tensor, bits: float, k_protocol: str = "pow2") -> torch.Tensor:
+    """Shared-codebook Lloyd fit matching the shipped encode: iters=10,
+    max_fit=max(4096, k*8) strided sampling over the given sub-vector pool.
+
+    `k_protocol` selects how bits map to codebook size: "pow2" snaps to 2^round(bits·4) as the
+    shipped `centroids_for_bits` does; "int" uses the 2×2 probe's raw int(2^(bits·4)) — for
+    fractional water-filled bits these diverge (e.g. 2.125 → 256 vs 362 centroids), and the
+    divergence is the suspected reason the 2×2 proxy signed the allocation wrong."""
+    k = centroids_for_bits(bits, SUB_DIM) if k_protocol == "pow2" else int(2 ** (bits * SUB_DIM))
     sample = pool[strided_indices(pool.shape[0], max(4096, k * 8), pool.device)]
     return lloyd_kmeans(sample, k, ITERS)[0]
 
 
 def arm_a(weights: torch.Tensor, grams: torch.Tensor, counts: torch.Tensor,
-          bits: torch.Tensor) -> tuple[float, float, list[float]]:
+          bits: torch.Tensor, k_protocol: str = "pow2") -> tuple[float, float, list[float]]:
     """Odd-row proxy rel L2 (2×2 protocol: fit even rows, eval odd) and routed-token-weighted
     output rel error from the per-expert Gram (fit all rows — eval is on inputs, so no in-sample
     risk), summed/weighted over experts."""
@@ -72,9 +77,9 @@ def arm_a(weights: torch.Tensor, grams: torch.Tensor, counts: torch.Tensor,
         w = weights[e].float()
         even = w[0::2].reshape(-1, SUB_DIM)
         odd = w[1::2].reshape(-1, SUB_DIM)
-        proxy += rel_err(assign_chunked(odd, fit_book(even, float(bits[e]))), odd)
+        proxy += rel_err(assign_chunked(odd, fit_book(even, float(bits[e]), k_protocol)), odd)
         pool = w.reshape(-1, SUB_DIM)
-        recon = assign_chunked(pool, fit_book(pool, float(bits[e]))).reshape(w.shape)
+        recon = assign_chunked(pool, fit_book(pool, float(bits[e]), k_protocol)).reshape(w.shape)
         delta = recon - w
         g = grams[e].to(w.device)
         err = math.sqrt((delta @ g * delta).sum().item()
@@ -212,6 +217,9 @@ def main(
     n_experts: int = typer.Option(32),
     calib_rows: int = typer.Option(512),
     seq_len: int = typer.Option(2048),
+    k_protocol: str = typer.Option(
+        "pow2", help="Codebook-size mapping: pow2 (shipped centroids_for_bits) | int (2×2 probe)."),
+    arm_a_only: bool = typer.Option(False, help="Stop after Arm A — skip quantization/Arm B."),
     smoke: bool = typer.Option(False, help="2 rows, no quantization — hook/capture smoke only."),
 ) -> None:
     torch.manual_seed(0)
@@ -248,13 +256,14 @@ def main(
     uniform = torch.full((n_experts,), float(avg_bits), device=weights.device)
 
     print(f"arm A · layer {layer} · first {n_experts} experts · d={SUB_DIM} · avg {avg_bits} bpw · "
-          f"span [{lo}, {hi}] · alloc storage mean = {alloc.mean():.2f}\n", flush=True)
+          f"span [{lo}, {hi}] · alloc storage mean = {alloc.mean():.2f} · "
+          f"k protocol = {k_protocol}\n", flush=True)
     print(f"{'bits':<18} {'odd-row relL2 sum':>16} {'routed out err':>16} "
           f"{'unweighted':>12}")
     results = {}
     errs_uniform: list[float] = []
     for label, bits in (("uniform 2.0", uniform), ("usage-alloc", alloc)):
-        proxy, routed, errs = arm_a(weights, grams, counts, bits)
+        proxy, routed, errs = arm_a(weights, grams, counts, bits, k_protocol)
         results[label] = (proxy, routed)
         if label == "uniform 2.0":
             errs_uniform = errs
@@ -265,7 +274,7 @@ def main(
         u, a = results["uniform 2.0"][idx], results["usage-alloc"][idx]
         print(f"Δ {name}: {(a - u) / u * 100:+.2f}%", flush=True)
 
-    if smoke:
+    if smoke or arm_a_only:
         return
 
     # --- Arm B: quantize uniform, replay the same tokens, compare selections. ---
