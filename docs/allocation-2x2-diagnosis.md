@@ -115,5 +115,8 @@ and PQ (perplexity). Remaining questions, in order:
 1. **Item #3 — routing × quantization.** The MoE-unique loss part of the claim (shared codebook
    fit on cold experts). The 2×2's PQ arm already hints the routed-weighted measure is the
    binding one — a routed-input reconstruction probe would resolve the proxy's blind spot.
+   **Resolved 2026-08-03** — the routed measure helps allocation (−12 to −15% reconstruction),
+   the 2×2's +1.0% was its codebook-size mapping, and the router barely re-routes under 2 bpw
+   quantization: [`docs/routing-x-quant-diagnosis.md`](routing-x-quant-diagnosis.md).
 2. A scalar end-to-end build is not justified: the probe's scalar win (−3.6% recon) is the same
    ordering ppl shows for PQ, and Phase 7's record says scalar-in-ppl transfers poorly.

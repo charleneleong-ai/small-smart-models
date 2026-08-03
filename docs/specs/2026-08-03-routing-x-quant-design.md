@@ -1,7 +1,7 @@
 # Research item #3 — routing × quantization
 
 **Study:** bits-per-brain · **Branch:** `feat/routing-x-quant` (off `main`)
-**Date:** 2026-08-03 · **Status:** design pending review
+**Date:** 2026-08-03 · **Status:** executed — see [`docs/routing-x-quant-diagnosis.md`](../routing-x-quant-diagnosis.md)
 
 ## Problem
 
