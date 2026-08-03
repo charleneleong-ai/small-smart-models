@@ -20,14 +20,15 @@ import math
 
 import torch
 
-__all__ = ["nearest_e8", "distinct_points", "calibrate_scale", "quantize_e8_fused"]
+__all__ = ["nearest_dn", "nearest_e8", "distinct_points", "strided_indices", "calibrate_scale",
+           "quantize_e8_fused"]
 
 # Prime, comfortably larger than any doubled coordinate magnitude these scales produce.
 HASH_BASE = 40507
 
 
-def nearest_d8(x: torch.Tensor) -> torch.Tensor:
-    """Nearest point of D8 (integer coordinates summing to an even number).
+def nearest_dn(x: torch.Tensor) -> torch.Tensor:
+    """Nearest point of D_n (integer coordinates summing to an even number), for rows of any width.
 
     Round coordinate-wise; if the sum comes out odd, re-round the single coordinate whose rounding
     was least confident, which is the cheapest way back onto the even-sum sublattice."""
@@ -46,8 +47,8 @@ def nearest_d8(x: torch.Tensor) -> torch.Tensor:
 def nearest_e8(x: torch.Tensor) -> torch.Tensor:
     """Nearest E8 point to each row of x (n, 8). E8 is D8 union its half-shift, so quantize to
     both cosets and keep whichever came out closer."""
-    a = nearest_d8(x)
-    b = nearest_d8(x - 0.5) + 0.5
+    a = nearest_dn(x)
+    b = nearest_dn(x - 0.5) + 0.5
     closer = (x - a).pow(2).sum(1) <= (x - b).pow(2).sum(1)
     return torch.where(closer.unsqueeze(1), a, b)
 
