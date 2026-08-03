@@ -17,7 +17,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-quant = ["vptq>=0.0.5", "aqlm>=1.1"]
+# vptq is deliberately absent: it ships no wheel past cp312 while this project requires >=3.13, so
+# it cannot resolve here. It poisoned every `uv sync` rather than only `--extra quant`, because
+# `uv lock` resolves all extras to build a universal lockfile. Restore it behind a
+# `python_version < "3.13"` marker, or build it from source, if the deferred VPTQ baseline happens.
+quant = ["aqlm>=1.1"]
 viz = ["matplotlib>=3.9"]  # experiments/plot_quality_vs_bpw.py
 
 # CI test surface. The unit suite exercises the pure-torch core
