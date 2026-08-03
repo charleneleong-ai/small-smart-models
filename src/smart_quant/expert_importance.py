@@ -172,18 +172,39 @@ def shrink_importance(
     return (n * raw + tau * layer_stat.to(raw.dtype).unsqueeze(0)) / (n + tau)
 
 
+def arithmetic_centered(bits: torch.Tensor, target: float, lo: float, hi: float) -> torch.Tensor:
+    """Shift-and-clamp `bits` so its *arithmetic* (storage) mean hits `target`, preserving the
+    [lo, hi] range and the per-expert ordering. Storage cost is sum(bits)/n — the quantity a byte
+    budget actually pays — not the usage-weighted mean the water-fill pins."""
+    dlo, dhi = lo - hi, hi - lo
+    for _ in range(60):
+        d = (dlo + dhi) / 2
+        if (bits + d).clamp(lo, hi).mean() < target:
+            dlo = d
+        else:
+            dhi = d
+    return (bits + dlo).clamp(lo, hi)
+
+
 def bits_from_frequency(
     freq: torch.Tensor,
     avg_bits: float,
     lo: float = 1.5,
     hi: float = 3.0,
+    storage_centered: bool = True,
 ) -> torch.Tensor:
-    """Per-expert bit budget in [lo, hi], increasing with usage, whose usage-weighted mean
-    is exactly `avg_bits` — so the footprint lands on target. Water-fills the hottest
-    experts up to `hi` first; `avg_bits` is clamped into [lo, hi] if the mean is infeasible."""
+    """Per-expert bit budget in [lo, hi], increasing with usage, whose *storage* mean
+    (sum(bits)/n) is exactly `avg_bits` — so the footprint lands on target. Water-fills the
+    hottest experts up to `hi` first; `avg_bits` is clamped into [lo, hi] if infeasible.
+
+    With `storage_centered=False` the raw water-fill is returned, whose *usage-weighted* mean
+    lands on target instead. That is not the footprint: skewed routing lets the arithmetic mean
+    drift below target, silently shrinking the tensor the encode must match — the Phase-3
+    artifact (rows targeted 2.0 bpw but realized ~1.63)."""
     freq = freq / freq.sum().clamp(min=1e-9)
     bits = torch.full_like(freq, float(lo))
-    surplus = min(max(avg_bits, lo), hi) - lo  # usage-weighted bits left to distribute
+    target = min(max(avg_bits, lo), hi)
+    surplus = target - lo  # usage-weighted bits left to distribute
     for i in torch.argsort(freq, descending=True):
         if surplus <= 1e-12:
             break
@@ -194,7 +215,9 @@ def bits_from_frequency(
         else:
             bits[i] = lo + surplus / freq[i].clamp(min=1e-9)
             surplus = 0.0
-    return bits
+    if not storage_centered:
+        return bits
+    return arithmetic_centered(bits, target, lo, hi)
 
 
 class HessianProfiler:
