@@ -2,15 +2,16 @@
 
 **Date:** 2026-08-01 · **Model:** Qwen3.6-35B-A3B, routed expert FFNs, ~2.0–2.5 bpw
 
-Ten measurements now bear on one question: can anything beat plain uniform product quantization
-with a single learned codebook per expert at `sub_dim=4`? All ten say no. The tenth — swapping the
+Eleven measurements now bear on one question: can anything beat plain uniform product quantization
+with a single learned codebook per expert at `sub_dim=4`? All eleven say no. The tenth — swapping the
 learned codebook for a **lattice** — looked like an escape under a reconstruction proxy and was
-refuted by the encode that followed.
+refuted by the encode that followed. The eleventh closes the direction that one pointed at, before
+any of it was built.
 
-This note consolidates them, because four scattered negative phases read as bad luck while ten
+This note consolidates them, because four scattered negative phases read as bad luck while eleven
 aligned measurements read as a result.
 
-## The ten that found nothing
+## The eleven that found nothing
 
 | # | what was tried | measured outcome |
 |---|---|---|
@@ -24,6 +25,7 @@ aligned measurements read as a result.
 | 8 | **Incoherence processing** | mu 6.15→5.03 as advertised, but MSE ±0.5% and the layerwise objective **worse** in 6/6 trials |
 | 9 | **Codebook shape** (`sub_dim` × n_books) | shipped `d=4, k=1024, 1 book` wins; `d=2` 8.5% worse; 4 books buys 1.3% for 3.7% more bpw |
 | 10 | **E8 lattice** (Ph 9) | `e8-25` 6.4607 vs 6.2137; `e8-20` **8.6827** vs 6.765 — loses, and the gap widens as rate falls |
+| 11 | **Zero-storage codebook** (Ph 10) | learned-vs-drawn gap **widens** 13.4% → 21.2% as k grows 256 → 16384 — the trellis premise fails |
 
 Five of these are full end-to-end encodes with perplexity at matched footprint (1–4, 10); the rest
 are direct measurements on real expert tensors.
@@ -103,13 +105,60 @@ The intermediate 2^20 single-expert run was separately degenerate and is discard
 262,144 sub-vectors while the shell kept ~1.05M, so nearly every sub-vector received its own code —
 memorisation, not quantisation. `calibrate_scale` now raises rather than return such a fit.
 
+## The trellis exit, measured before building it
+
+Phase 9's closing direction was a trellis. QTIP's bet is that one buys an enormous *effective*
+codebook at zero storage: codewords are pseudorandomly generated from a Gaussian rather than
+tabulated, making the codebook simultaneously storage-free and shape-matched. The cheap form of that
+question, asked before writing a Viterbi decoder — at identical index cost, how much does *learning*
+where codewords sit buy over *drawing* them from the right distribution, and does it shrink as k
+grows?
+
+Four codebooks at identical bits per index, layer 13, `d=4`, 8 experts. Each expert's 524,288
+sub-vectors are split by parity into disjoint halves — codebooks are fit on 262,144 from one half
+and scored on 131,072 from the other, so the two k-means rows are never scored in-sample
+(relative reconstruction error, lower is better; `gauss gap` is `gaussian-global` over
+`kmeans-expert`):
+
+| k | bpw | kmeans-expert | kmeans-global | gaussian-global | d4-global | gauss gap |
+|---|-----|---------------|---------------|-----------------|-----------|-----------|
+| 256 | 2.00 | 0.3160 | 0.3173 | 0.3583 | 0.5253 | 13.4% |
+| 1024 | 2.50 | 0.2256 | 0.2288 | 0.2553 | 0.3213 | 13.2% |
+| 4096 | 3.00 | 0.1585 | 0.1658 | 0.1823 | 0.1924 | 15.0% |
+| 16384 | 3.50 | 0.1070 | 0.1195 | 0.1297 | 0.1361 | 21.2% |
+
+The last column decides it. If the trellis's huge effective k were the missing piece, the gap would
+close as k grows. It widens — 13.4% → 21.2%. More effective codebook moves a shape-matched free
+codebook *further* from a learned one, not closer, so the mechanism QTIP relies on does not hold on
+these weights.
+
+Splitting the gap into its two axes shows why nothing zero-storage recovers it. At 2.00 bpw,
+per-expert *adaptation* is worth 0.4% (`kmeans-expert` → `kmeans-global`) while *learned placement*
+is worth 12.9% (`kmeans-global` → `gaussian-global`) — Lloyd's spreading does nearly all the work,
+and drawing from the correct distribution does not reproduce it. By 3.50 bpw adaptation becomes the
+larger term (11.7% vs 8.5%). A generated codebook can have neither.
+
+Two side results fall out. `d4-global` — spread optimally, shaped wrong — is 46.6% worse than
+`gaussian-global` at k=256 but only 4.9% worse at k=16384, reproducing Phase 9's rate-dependent
+lattice penalty from an independent instrument. And at the rates we ship, one *global* codebook
+costs only 0.4–1.4% over 32 per-expert ones, which is a simplification available for the taking
+rather than another null.
+
+Two limits on the claim. This is reconstruction error, not perplexity, and Phase 7 stands as the
+reminder that the two can disagree — here the proxy argues *against* the trellis, so the risk is
+that it understates one, though a gap widening 13% → 21% makes a reversal unlikely. And
+`gaussian-global` models a zero-storage, shape-matched, unlearned codebook, not trellis *sequence*
+decoding; what is refuted is the codebook-shape premise, not every conceivable trellis.
+
 ## What this leaves
 
-The codebook storage wall is real and the shape sweep measures it directly. What Phase 9 rules out
-is escaping it with a *fixed-rate* structured quantizer. The remaining direction is the one the
-field took: entropy-coded or trellis quantization, where the code's frequency non-uniformity is
-priced in rather than paid for. That is QTIP's design, and it is why QTIP uses a trellis rather than
-a lattice shell.
+The codebook storage wall is real, and both structured ways around it are now measured: a fixed-rate
+lattice loses on shape (Phase 9), and a generated zero-storage codebook loses on placement, by more
+as the rate rises (Phase 10). Entropy coding is the one mechanism still untested — it is what made
+the lattice look competitive before that confound was removed — but a learned codebook's codes are
+already near-uniform in frequency, so it is a route to making *lattices* viable rather than to
+beating what we ship.
 
 Reproduce with `experiments/diagnose_lattice.py` (proxy), `experiments/diagnose_rotation.py`
-(rotation), and the `e8-20` / `e8-25` rows of `results.jsonl` (encodes).
+(rotation), `experiments/diagnose_codebook_shape.py` (shape vs placement), and the `e8-20` /
+`e8-25` rows of `results.jsonl` (encodes).
