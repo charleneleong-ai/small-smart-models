@@ -141,27 +141,30 @@ Caveat: single calibration domain (C4) — domain-specific calibration could shi
 Fake-quantized the routed expert FFNs (all 40 layers, `sub_dim` 4), wikitext-2 perplexity vs
 the fp16 5.92 ceiling:
 
-| build | allocation | per-expert bits | wikitext-2 ppl | Δ vs fp16 |
-|---|---|---|---|---|
-| fp16 | — | — | 5.92 | — |
-| pq2-uniform | uniform | 2.0 | **6.77** | +14% |
-| pq2-expert-gentle | usage-driven | 1.8–2.3 | 7.07 | +19% |
-| pq2-expert | usage-driven | 1.5–3.0 | 7.68 | +30% |
+| build | allocation | per-expert bits | realized bpw | wikitext-2 ppl | Δ vs fp16 |
+|---|---|---|---|---|---|
+| fp16 | — | — | — | 5.92 | — |
+| pq2-uniform | uniform | 2.0 | ~2.0 | **6.77** | +14% |
+| pq2-expert-storage | usage-driven | 2.0 target | **2.099** | **6.61** | +12% |
+| pq2-expert-gentle | usage-driven | 1.8–2.3 | ~1.86* | 7.07 | +19% |
+| pq2-expert | usage-driven | 1.5–3.0 | ~1.63* | 7.68 | +30% |
 
-**Headline: expert-importance allocation is *counterproductive*, monotonically in strength —
-uniform (6.77) < gentle 1.8–2.3 (7.07) < aggressive 1.5–3.0 (7.68).** Even mild reallocation
-loses to uniform, and more reallocation loses more, so this is not an over-aggressiveness
-artifact: usage-driven bit allocation fundamentally does not help at this skew. Textbook
-convexity explains it — reconstruction error is convex in bits, so by Jensen spreading bits
-unequally raises the usage-weighted error *unless* the skew is strong enough to overcome the
-penalty. At entropy 0.90 (phase 2) it is not, so uniform is near-optimal and any deviation
-hurts. The naive "spend bits where they're used" intuition fails on a moderately-skewed
-3B-active MoE — a clean, against-intuition result.
+\* not recorded at the time; layer-13 arithmetic means (usage-weighted target ≠ storage — see
+[`docs/allocation-2x2-diagnosis.md`](../../allocation-2x2-diagnosis.md)).
 
-Caveats: fake-quant (dequantized weights) + perplexity + one dataset; a *gentler* allocation
-range than [1.5, 3.0] might avoid the loss (untested). The imatrix cross-comparison (unsloth
-UD-IQ2_M) remains the deferred llama.cpp step, so this is codebook-uniform-vs-expert, not yet
-codebook-vs-imatrix.
+**Original headline — usage allocation is counterproductive, monotonically in strength — was a
+footprint artifact, corrected since.** `bits_from_frequency` pinned the *usage-weighted* mean, so
+the aggressive run realized ~1.63 bpw at a 2.0 target and the monotone 6.77 < 7.07 < 7.68 pattern
+is exactly what a shrinking tensor produces. Re-run with the *storage* mean held at 2.0
+(`pq2-expert-storage`), usage allocation scores **6.61 vs 6.77** — a small free win, consistent
+with the field (BitsMoE, imatrix) once the byte budget is fixed. The Phase-3 "uniform is
+near-optimal" Jensen argument was measuring the wrong budget.
+
+Caveats: fake-quant (dequantized weights) + perplexity + one dataset. The imatrix cross-comparison
+(unsloth UD-IQ2_M) remains the deferred llama.cpp step, so this is codebook-uniform-vs-expert, not
+yet codebook-vs-imatrix. The `pq2-expert-storage` win (~0.16 ppl) is at 2.099 realized bpw vs the
+uniform's ~2.0, so part of it is a ~5% footprint advantage; the direction, not the size, is the
+claim.
 
 ### Phase 4 — imatrix comparison (llama.cpp, wikitext-2, 40-chunk subset)
 
