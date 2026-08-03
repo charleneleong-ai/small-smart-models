@@ -38,6 +38,22 @@ def rel_err(recon: torch.Tensor, ref: torch.Tensor) -> float:
     return float((recon - ref).norm() / ref.norm())
 
 
+def footprint_match(bits: torch.Tensor, target: float, lo: float, hi: float) -> torch.Tensor:
+    """Shift-and-clamp a water-fill so its *arithmetic* mean lands on `target`, preserving both
+    the [lo, hi] range and the usage ordering. `bits_from_frequency` pins the *usage-weighted*
+    mean, which is not the storage cost — with skewed routing frequency it drifts below target
+    (Phase-3 rows realized ~1.6 bpw while targeting 2.0). Storage is sum(bits)/n, so the matched
+    control re-centres on that."""
+    dlo, dhi = lo - hi, hi - lo
+    for _ in range(60):
+        d = (dlo + dhi) / 2
+        if (bits + d).clamp(lo, hi).mean() < target:
+            dlo = d
+        else:
+            dhi = d
+    return (bits + dlo).clamp(lo, hi)
+
+
 def assign_chunked(pool: torch.Tensor, book: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(pool)
     for i in range(0, pool.shape[0], ASSIGN_CHUNK):
@@ -98,11 +114,14 @@ def main(
     freqs = load_freq(freq, layer, n_experts)
     fits = [w[e][0::2].reshape(-1, SUB_DIM) for e in range(n_experts)]
     evals = [w[e][1::2].reshape(-1, SUB_DIM) for e in range(n_experts)]
-    alloc = bits_from_frequency(freqs, avg_bits, lo=lo, hi=hi)
+    raw = bits_from_frequency(freqs, avg_bits, lo=lo, hi=hi)
+    alloc = footprint_match(raw, avg_bits, lo, hi)
     uniform = torch.full((n_experts,), float(avg_bits))
 
     print(f"layer {layer} · {n_experts} experts · d={SUB_DIM} · avg {avg_bits} bpw · "
           f"span [{lo}, {hi}] · eval = odd rows, disjoint from PQ fit\n", flush=True)
+    print(f"note: raw water-fill arithmetic mean {raw.mean():.2f} bpw (usage-weighted pinned to "
+          f"{avg_bits}); footprint-matched to {avg_bits} for the table", flush=True)
 
     def scalar_cell(b: torch.Tensor) -> float:
         return sum(scalar_rel_err(w[e], float(b[e]), evals[e]) for e in range(n_experts))
@@ -124,14 +143,19 @@ def main(
           f"alloc {alloc.mean():.2f}")
 
     print(f"\nR-D curve at uniform rate (rel L2, sum over {n_experts} experts):")
-    print(f"{'bpw':>6} {'scalar':>10} {'pq':>10} {'pq slope dB/bit':>16}")
-    prev: float | None = None
+    print(f"{'bpw':>6} {'scalar':>10} {'pq':>10} {'scalar dB/bit':>14} {'pq dB/bit':>12}")
+    prev_b: float | None = None
+    prev_s = prev_p = 0.0
     for b in RATES:
         s = scalar_cell(torch.full((n_experts,), b))
         p = pq_cell(torch.full((n_experts,), b))
-        slope = (20 * math.log10(p / prev) / (b - prev)) if prev else float("nan")
-        print(f"{b:>6.2f} {s:>10.4f} {p:>10.4f} {slope:>16.1f}", flush=True)
-        prev = b
+        if prev_b is not None:
+            ss = 20 * math.log10(s / prev_s) / (b - prev_b)
+            sp = 20 * math.log10(p / prev_p) / (b - prev_b)
+        else:
+            ss = sp = float("nan")
+        print(f"{b:>6.2f} {s:>10.4f} {p:>10.4f} {ss:>14.1f} {sp:>12.1f}", flush=True)
+        prev_b, prev_s, prev_p = b, s, p
 
 
 if __name__ == "__main__":

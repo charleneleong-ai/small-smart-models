@@ -45,12 +45,15 @@ parity discipline. Allocation signal is the **real** Phase-2 routing frequency
 | **scalar per-row** | 2.0 | `bits_from_frequency(freq, 2.0, 1.5, 3.0)` | allocation **helps** (−) |
 | **PQ shared-codebook** | k=256 | per-expert `k = 2^(4·b_e)` | allocation **hurts** (+) |
 
-- Matched on mean allocated bpw by construction (`bits_from_frequency` pins the usage-weighted
-  mean to `avg_bits`); the script prints the realized mean for both families.
+- Matched on **arithmetic** mean bpw (the storage cost): `bits_from_frequency` pins the
+  *usage-weighted* mean, which drifts with routing skew — the Phase-3 water-fill realized ~1.6
+  bpw while targeting 2.0, so those rows were not footprint-matched. The script re-centres the
+  water-fill with a shift-and-clamp (`footprint_match`) so `mean(bits) == avg_bits`, preserving
+  ordering and the `[lo, hi]` range, and prints the raw drift for the record.
 - Metric: sum over experts of `rel L2` on the disjoint eval half.
 - Second instrument: the **R-D curve** at uniform rate `b ∈ {1.75 … 3.0}`, reporting the slope in
-  dB/bit. Scalar should show ≈ −6 dB/bit; PQ should be shallower. The curve is the mechanism
-  spelled out, independent of whether allocation lands where expected.
+  dB/bit per family. Scalar should be steeper than PQ; the gap is the fit-limited wall, stated
+  independently of where the allocation lands.
 
 ## Run
 
@@ -79,6 +82,11 @@ strongest). A second run at the gentle span `[1.8, 2.3]` is the sensitivity line
   This phase is deliberately a cheap proxy to choose the next *end-to-end* encode; if the
   interaction shows, the follow-up builds a scalar quantizer into the encode path
   (`quantize_experts`) for a real ppl row.
+- **Usage-weighted ≠ storage footprint.** Measured, not assumed: the first run showed the raw
+  water-fill arithmetic mean at 1.59 bpw vs the 2.0 target. The table controls for it; the Phase-3
+  end-to-end rows did not, so their *negative* verdict stood at a *smaller* footprint — which
+  makes the negative stronger, not weaker, but the comparison was not clean. Worth a line in the
+  diagnosis.
 - **32-expert slice.** First-32 of 256 renormalised is a coarser allocation than Phase 3's full
   tensor. The mechanism claim does not need the full tensor; replication does, and is the
   end-to-end follow-up's job.
