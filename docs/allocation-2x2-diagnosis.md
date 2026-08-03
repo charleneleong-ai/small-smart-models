@@ -64,7 +64,7 @@ flip.
 ## The corrected end-to-end row
 
 Re-ran `pq2-expert` with the arithmetic re-centring in the encode path
-([`fix/arithmetic-footprint-allocation`](../../tree/fix/arithmetic-footprint-allocation/src/smart_quant/expert_importance.py))
+([`src/smart_quant/expert_importance.py`](../../tree/main/src/smart_quant/expert_importance.py))
 so the *storage* mean lands on 2.0 bpw. Same model, same eval, same wikitext-2 protocol:
 
 | row | allocation | target bpw | realized bpw | span | wikitext ppl | Δ vs uniform |
@@ -112,10 +112,8 @@ value. No scalar end-to-end was built, so the scalar arm's transfer is untested.
 The corrected row closes item #2: allocation works, at a fixed byte budget, for both scalar (proxy)
 and PQ (perplexity). Remaining questions, in order:
 
-1. **Fold the correction into the record.** `docs/local-optimum.md` measurement #1 flips from a
-   negative to the field-consistent win; the study plan's Phase-3 table gains the corrected row.
-2. **Item #3 — routing × quantization.** The MoE-unique loss part of the claim (shared codebook
+1. **Item #3 — routing × quantization.** The MoE-unique loss part of the claim (shared codebook
    fit on cold experts). The 2×2's PQ arm already hints the routed-weighted measure is the
    binding one — a routed-input reconstruction probe would resolve the proxy's blind spot.
-3. A scalar end-to-end build is not justified: the probe's scalar win (−3.6% recon) is the same
+2. A scalar end-to-end build is not justified: the probe's scalar win (−3.6% recon) is the same
    ordering ppl shows for PQ, and Phase 7's record says scalar-in-ppl transfers poorly.
