@@ -2,11 +2,12 @@
 
 **Date:** 2026-08-01 · **Model:** Qwen3.6-35B-A3B, routed expert FFNs, ~2.0–2.5 bpw
 
-Eleven measurements now bear on one question: can anything beat plain uniform product quantization
-with a single learned codebook per expert at `sub_dim=4`? All eleven say no. The tenth — swapping the
+Twelve measurements now bear on one question: can anything beat plain uniform product quantization
+with a single learned codebook per expert at `sub_dim=4`? All twelve say no. The tenth — swapping the
 learned codebook for a **lattice** — looked like an escape under a reconstruction proxy and was
 refuted by the encode that followed. The eleventh closes the direction that one pointed at, before
-any of it was built.
+any of it was built. The twelfth returns to the first and finds its magnitude was partly a footprint
+artifact — but the corrected comparison still loses.
 
 This note consolidates them, because four scattered negative phases read as bad luck while eleven
 aligned measurements read as a result.
@@ -15,7 +16,7 @@ aligned measurements read as a result.
 
 | # | what was tried | measured outcome |
 |---|---|---|
-| 1 | **Expert-level bit allocation** (Ph 3) | `pq2-expert` 7.68 vs `pq2-uniform` 6.77 — badly worse |
+| 1 | **Expert-level bit allocation** (Ph 3) | `pq2-expert` 7.68 vs `pq2-uniform` 6.77 — worse, but the allocated rows realized ~1.63 bpw, not 2.0 (see #12) |
 | 2 | **Second-order residual codebooks** (Ph 6a) | `rvq25` 6.54 vs `pq25` 6.21; `rvq20` 7.45 vs 6.77 |
 | 3 | **Activation weighting** (Ph 7) | `wpq25` 6.2325 vs 6.2137; alpha sweep 0.25→1.0 never reaches baseline |
 | 4 | **GPTQ error compensation** (Ph 8) | `gptq25` 6.2400 vs 6.2137 — *actively harmful*, ~3% codebook drift |
@@ -26,9 +27,23 @@ aligned measurements read as a result.
 | 9 | **Codebook shape** (`sub_dim` × n_books) | shipped `d=4, k=1024, 1 book` wins; `d=2` 8.5% worse; 4 books buys 1.3% for 3.7% more bpw |
 | 10 | **E8 lattice** (Ph 9) | `e8-25` 6.4607 vs 6.2137; `e8-20` **8.6827** vs 6.765 — loses, and the gap widens as rate falls |
 | 11 | **Zero-storage codebook** (Ph 10) | learned-vs-drawn gap **widens** 13.4% → 21.2% as k grows 256 → 16384 — the trellis premise fails |
+| 12 | **Allocation mechanism 2×2** | at true matched footprint the same water-fill helps scalar (−3.6%) and hurts PQ (+1.0%); Phase 3's magnitude was substantially footprint drift |
 
-Five of these are full end-to-end encodes with perplexity at matched footprint (1–4, 10); the rest
-are direct measurements on real expert tensors.
+Five of these are full end-to-end encodes with perplexity (1–4, 10; #1 at the footprint it actually
+realized, see below); the rest are direct measurements on real expert tensors.
+
+### #12 corrected the first measurement
+
+The 2×2 ([`experiments/diagnose_allocation_2x2.py`](experiments/diagnose_allocation_2x2.py),
+[writeup](allocation-2x2-diagnosis.md)) ran the usage water-fill against both quantizer families
+on real layer-13 weights. Two findings. First, `bits_from_frequency` pins the *usage-weighted* mean,
+which is not the storage cost — with real routing skew the aggressive Phase-3 allocation realized
+**1.63 bpw**, not 2.0, so `7.68 vs 6.77` was partly a smaller-tensor effect, and the
+"monotone in allocation strength" pattern is exactly what footprint drift produces. Second, with a
+true arithmetic-footprint-matched allocation the same water-fill **helps** a rate-limited scalar
+family (−3.6%) and **hurts** the fit-limited PQ (+1.0%) — the mechanism interaction, present but
+small. Uniform PQ still wins; the field's allocations help because they hold their byte budget
+fixed, and ours did not.
 
 ## Why they all fail, in one sentence
 
