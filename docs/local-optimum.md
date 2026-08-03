@@ -47,10 +47,12 @@ fit-limited PQ (+1.0%).
 
 The corrected end-to-end encode resolved the tension. Re-centred so the *storage* mean is 2.0 bpw,
 `pq2-expert-storage` scores **6.607 vs 6.765** at ~2.099 realized bpw — allocation is a free win,
-and the confounded 7.68/7.07 were entirely footprint. The probe's PQ sign failed to transfer
-because it sampled rows uniformly, which cannot see that ppl rewards the *routed* experts. The
-field's allocations help because they hold their byte budget fixed; the study's original water-fill
-did not.
+and the confounded 7.68/7.07 were entirely footprint. The probe's PQ sign failed to transfer, and
+the mechanism behind that is now pinned: on the *routed inputs* the allocation actually helps
+(−12 to −15% output error), and the probe's +1.0% was its codebook-size mapping, not the routing
+blind spot — [`docs/routing-x-quant-diagnosis.md`](routing-x-quant-diagnosis.md). The field's
+allocations help because they hold their byte budget fixed; the study's original water-fill did
+not.
 
 ## Why they all fail, in one sentence
 
