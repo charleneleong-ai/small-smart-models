@@ -115,6 +115,72 @@ ParetoQ gives scaling laws across 1 / 1.58 / 2 / 4-bit. Field consensus: 4-bit P
 1.58-bit only pays if you can afford QAT or need edge deployment. Our PTQ-at-2.5-bpw work does not
 compete here and should not claim to.
 
+## Beyond quantization: other routes to small-but-smart
+
+Quantization shrinks weights without changing the model's computation graph. Three other families
+change the model itself:
+
+### Knowledge distillation
+
+Training a smaller model from a larger teacher. TinyLLaMA (1.1B), Phi-1.5/2/3 (1.3–3.8B), and
+Gemma 2B all use this route. BitNet Distillation (ICLR 2026) distills to 1.58-bit with QAT. The
+trade-off: distillation needs the teacher at training time (GPU-hours, data pipeline) and produces a
+*new* model — not a shrink of an existing one. For deployment, a distilled 3B model may beat a
+quantized 35B model at equal compute budget, but it is a different model with different capabilities.
+
+Our study is PTQ: we shrink an existing model without retraining. Distillation is complementary —
+the question is whether PTQ at 2.5 bpw can close the gap to a distilled model of equal active
+parameters.
+
+### Structured pruning
+
+Removing entire neurons, attention heads, or layers. For MoEs, the most natural form is **expert
+pruning** — dropping entire experts from the routing, reducing both parameters and active FLOPs.
+Structured pruning is irreversible (unlike quantization, which is a lossy but reversible transform)
+and usually requires a fine-tuning pass to recover accuracy.
+
+MoE-specific variants:
+- **Expert pruning** (e.g., ShortGPT, SliceGPT for MoEs): remove experts with low importance
+  scores (router frequency, gradient sensitivity, or activation magnitude). Reduces total params
+  and routing overhead.
+- **Expert merging** (e.g., Expert Merging via CKA similarity): combine similar experts into a
+  single expert, reducing parameter count while preserving diversity.
+- **Expert sharing** (e.g., ExpertPP): route multiple tokens to the same expert, amortizing
+  storage cost.
+
+These are orthogonal to quantization: you can prune 256→128 experts AND quantize each to 2.5 bpw.
+The combined effect would be additive — halving expert count and halving bits per expert.
+
+### Sparse activation / expert dropping
+
+Dropping experts at inference time without retraining. A router's top-k gate can be relaxed to
+top-k' (k' < k), activating fewer experts per token. This trades accuracy for speed — fewer
+active parameters means lower latency and memory. Unlike pruning, this is dynamic: different
+tokens can activate different expert subsets.
+
+For our study's setting (top-8 of 256 experts), dropping to top-4 would halve active expert FLOPs
+but likely degrade perplexity significantly — the router already selects 8 for a reason. The
+interaction with quantization is untested: do quantized experts degrade more or less under
+aggressive top-k?
+
+### Where our study sits
+
+Our PTQ study asks: *given a fixed model architecture, how far can we shrink the weights?*
+The answer is ~5–8× at ≤3pp capability loss. The other families ask different questions:
+
+| family | question | our overlap |
+|---|---|---|
+| PTQ (this study) | How far can we shrink weights? | 5–8× at 2.5 bpw |
+| QAT | How far can we shrink with retraining? | orthogonal (1.58-bit BitNet) |
+| Distillation | How small can a new model be? | complementary (3B distilled vs 35B quantized) |
+| Pruning | How many experts/neurons can we remove? | additive (prune + quantize) |
+| Expert dropping | How few experts can we activate? | orthogonal (inference-time trade-off) |
+
+The field's strongest 2-bit results (QTIP, QuIP#) combine PTQ with trellis/entropy coding —
+a different escape from the codebook storage wall than our shared-codebook PQ. Our contribution
+is measuring the local optimum: at 2.0–2.5 bpw with a learned codebook, nothing measured beats
+uniform shared-codebook PQ on these weights.
+
 ## Implications, ranked
 
 1. **Entropy-coded or trellis quantization.** The one direction still open, and the one the field

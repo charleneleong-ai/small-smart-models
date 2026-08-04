@@ -185,6 +185,11 @@ the lattice look competitive before that confound was removed — but a learned 
 already near-uniform in frequency, so it is a route to making *lattices* viable rather than to
 beating what we ship.
 
+The capability battery closes the "smart" half of the claim: at 2.5 bpw, task accuracy degrades
+≤2pp on hellaswag, winogrande, and mmlu; at 2.0 bpw, ≤3pp. The ppl-stable ranking transfers —
+methods that lose on perplexity lose on capability too. See
+[`docs/experiments/bits-per-brain.md`](experiments/bits-per-brain.md) for the full table.
+
 Reproduce with `experiments/diagnose_lattice.py` (proxy), `experiments/diagnose_rotation.py`
 (rotation), `experiments/diagnose_codebook_shape.py` (shape vs placement), and the `e8-20` /
 `e8-25` rows of `results.jsonl` (encodes).
