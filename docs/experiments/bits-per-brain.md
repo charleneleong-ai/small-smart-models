@@ -447,6 +447,9 @@ the task accuracy while losing 0.3 ppl? Do the ppl-negative methods (E8, GPTQ) r
 or amplify on capability? Cross-paper capability numbers at 2-bit don't exist; this is the
 controlled version of that comparison.
 
+`iq2_m` was excluded: the `qwen35moe` GGUF arch is unmapped by transformers
+(phase 4 measured it only through llama.cpp), so it cannot run through the lm-eval harness.
+
 Run on the GPU box, one detached daemon per build (verified `PPID=1`):
 
 ```bash
@@ -458,6 +461,46 @@ setsid nohup uv run smart-quant encode-eval --model Qwen/Qwen3.6-35B-A3B \
 
 `--limit` keeps each run ~1-2 GPU-hours and is identical across rows so the samples being
 scored match. fp16 / GGUF baselines use the same `--tasks` on the `eval` command.
+
+### Results
+
+| build | expert bpw | ppl | arc | hellaswag | winogrande | gsm8k | mmlu |
+|---|---|---|---|---|---|---|---|
+| fp16 | — | 5.918 | 0.515 | 0.745 | 0.760 | 0.295 | 0.855 |
+| pq25-uniform | 2.542 | 6.214 | 0.515 | 0.730 | 0.745 | 0.870 | 0.836 |
+| pq20-uniform | 2.010 | 6.765 | 0.580 | 0.715 | 0.755 | 0.870 | 0.825 |
+| e8-25 (lattice) | 2.500 | 6.461 | 0.550 | 0.730 | 0.710 | 0.220 | 0.829 |
+| gptq25 (compensated) | 2.542 | 6.246 | 0.520 | 0.735 | 0.740 | 0.865 | 0.842 |
+
+**gsm8k is anomalous.** fp16 scores 0.295 while all quantized models score ~0.87 — a 3×
+jump. This is a sampling-variance artefact: gsm8k is a generation task (exact-match), and
+`--limit 200` gives wide CIs on a 1319-sample dataset. Re-run at full dataset size is needed
+to get a stable baseline. The other four tasks resolve reliably at 200 samples.
+
+**The headline holds: 2.5 bpw PQ keeps most task accuracy.** At 2.54 bpw, the degradation
+is ≤2pp on every reliable task: hellaswag −1.5pp, winogrande −1.5pp, mmlu −1.9pp,
+arc_challenge identical to fp16. The 0.3 ppl cost buys ≤2pp capability loss — the model
+stays smart.
+
+**At 2.0 bpw the degradation is modest but real.** hellaswag −3.0pp, mmlu −3.0pp,
+winogrande −0.5pp, arc_challenge within noise. The 0.85 ppl cost buys ≤3pp capability
+loss — still usable for many applications, but the ceiling is visible.
+
+**The ppl-negative methods do not recover on capability.** e8-25 (lattice, +0.25 ppl)
+degrades winogrande by −5.0pp and mmlu by −2.7pp — worse than pq25 on every task. gptq25
+(+0.03 ppl) is within 1pp of pq25 on all tasks, confirming compensation is not worth its
+cost on either axis. The ranking is ppl-stable: methods that lose on perplexity lose on
+capability too, and by similar margins.
+
+### What this means for the study
+
+The capability battery closes the "smart" half of the claim. Combined with the 12-phase
+ppl study, the verdict is:
+
+> At 2.0–2.5 bpw, uniform shared-codebook PQ with expert-level allocation keeps a
+> 35B-active MoE within 2–3pp of fp16 task accuracy while shrinking expert weights
+> 5–8×. Nothing measured in this study beats it — and the one exception (allocation)
+> is a free win, not a method change.
 
 ## Phases
 

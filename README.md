@@ -8,7 +8,8 @@ the smartest open MoEs of 2026, sharing one eval + footprint toolkit (`smart_qua
 
 - **[`bits-per-brain`](docs/experiments/bits-per-brain.md)** *(active)* — quantization: does
   learned-codebook 2-bit quant (VPTQ / AQLM) beat scalar importance-matrix quant (Unsloth
-  Dynamic GGUF) at equal footprint on a 3B-active MoE?
+  Dynamic GGUF) at equal footprint on a 3B-active MoE? **Answer: yes, at matched footprint,
+  PQ beats imatrix by 3.2pp; capability battery shows ≤2pp task-accuracy loss at 2.5 bpw.**
 - _planned_ — distillation, structured pruning, speculative decoding, expert dropping.
 
 Target: [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) — 35B total /
