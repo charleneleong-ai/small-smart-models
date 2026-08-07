@@ -50,6 +50,8 @@ def eval_model(
                                          "battery (e.g. arc_challenge,gsm8k); appends task_acc."),
     limit: int = typer.Option(None, help="Per-task sample limit for the battery (None = full)."),
     out: Path = typer.Option(Path("experiments/bits-per-brain/results.jsonl")),
+    wandb: bool = typer.Option(False, help="Log metrics to Weights & Biases."),
+    wandb_project: str = typer.Option("small-smart-models", help="W&B project name."),
 ) -> None:
     """Sliding-window wikitext perplexity for one model; append a row to results.jsonl.
 
@@ -90,6 +92,15 @@ def eval_model(
         f.write(json.dumps(row) + "\n")
     console.print(f"[bold]{label}[/bold]  wikitext-2 ppl = [bold]{ppl:.4f}[/bold]  ->  {out}")
 
+    if wandb:
+        import wandb
+        wandb.init(project=wandb_project, name=label, config=row)
+        log_row = {"wikitext_ppl": round(ppl, 4)}
+        if task_acc:
+            log_row.update({f"acc/{k}": v for k, v in task_acc.items()})
+        wandb.log(log_row)
+        wandb.finish()
+
 
 @app.command("encode-eval")
 def encode_eval(
@@ -119,6 +130,8 @@ def encode_eval(
                                          "battery (e.g. arc_challenge,gsm8k); appends task_acc."),
     limit: int = typer.Option(None, help="Per-task sample limit for the battery (None = full)."),
     out: Path = typer.Option(Path("experiments/bits-per-brain/results.jsonl")),
+    wandb: bool = typer.Option(False, help="Log metrics to Weights & Biases."),
+    wandb_project: str = typer.Option("small-smart-models", help="W&B project name."),
 ) -> None:
     """Fake-quantize the expert FFNs (uniform or expert-importance allocation), then measure
     wikitext perplexity; append a row to results.jsonl.
@@ -180,6 +193,19 @@ def encode_eval(
         f.write(json.dumps(row) + "\n")
     console.print(f"[bold]{label}[/bold] ({allocation}, ~{avg_bits}bpw -> {expert_bpw:.3f} expert bpw)  "
                   f"wikitext ppl = [bold]{ppl:.4f}[/bold]  ->  {out}")
+
+    if wandb:
+        import wandb
+        wandb.init(project=wandb_project, name=label, config=row)
+        log_row = {
+            "wikitext_ppl": round(ppl, 4),
+            "expert_bpw": round(expert_bpw, 3),
+            "model_bpw": round(model_bpw, 3),
+        }
+        if task_acc:
+            log_row.update({f"acc/{k}": v for k, v in task_acc.items()})
+        wandb.log(log_row)
+        wandb.finish()
 
 
 def load_for_calibration(model: str) -> tuple[Any, Any, Any, Any]:
