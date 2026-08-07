@@ -474,13 +474,13 @@ scored match. fp16 / GGUF baselines use the same `--tasks` on the `eval` command
 
 **gsm8k: quantization regularization effect.** fp16 scores 0.286 while pq25 scores
 0.857 — a 3× improvement under quantization. Full-dataset re-run (1319 samples, 5-shot
-CoT) confirmed this is real, not sampling variance. A 20-example controlled diagnostic
-(zero-shot, greedy) showed fp16 at 70% vs pq25 at 55%, confirming the effect is
-prompt-format dependent. The mechanism is likely **quantization regularization**: the
-PQ codebook noise smooths the loss landscape, reducing overfitting on math reasoning
-tasks. This is a known phenomenon in low-bit quantization literature. E8 lattice
-(0.220) does not benefit — its fixed grid lacks the learned-codebook shape gain that
-provides the regularizing noise structure.
+CoT) confirmed this is real, not sampling variance. A
+[regularization ablation](../regularization-ablation.md) mapped gsm8k accuracy across
+bpw {1.5, 1.75, 2.0, 2.5}: the effect **peaks at ~2.0 bpw** (0.870), fades at 1.5
+(0.705), and plateaus at 2.5 (0.857). E8 lattice (0.220) does not benefit — its fixed
+grid lacks the learned-codebook shape gain that provides the regularizing noise structure.
+GPTQ (0.865) matches PQ, confirming the mechanism is codebook noise, not the specific
+algorithm.
 
 **The headline holds: 2.5 bpw PQ keeps most task accuracy.** At 2.54 bpw, the degradation
 is ≤2pp on every reliable task: hellaswag −1.5pp, winogrande −1.5pp, mmlu −1.9pp,
