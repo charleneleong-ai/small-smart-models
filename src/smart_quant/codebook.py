@@ -105,7 +105,16 @@ def pq_quantize(
             (torch.arange(pool.shape[0])[sel]) % groups]
         centroids = lloyd_kmeans(pool[sel], n_centroids, iters, dim_weight=fit_w)[0]
         pool_w = None if group_weight is None else group_weight.repeat(out, 1)
-        return assign(pool, centroids, pool_w).reshape(out, groups), centroids.to(weight.dtype)
+        # Chunked assignment to avoid OOM when pool is large (e.g. >5M points at 3.0+ bpw).
+        # cdist on (N, d) vs (k, d) materialises (N, k) — at N=13M, k=4096 that's ~200 GB.
+        n_pool = pool.shape[0]
+        chunk = max(1, min(n_pool, 2_000_000 // n_centroids))  # keep (chunk, k) < ~32 GB
+        codes = torch.empty(n_pool, dtype=torch.long, device=pool.device)
+        for i in range(0, n_pool, chunk):
+            sl = slice(i, min(i + chunk, n_pool))
+            pw_sl = None if pool_w is None else pool_w[sl]
+            codes[sl] = assign(pool[sl], centroids, pw_sl)
+        return codes.reshape(out, groups), centroids.to(weight.dtype)
 
     codes = torch.empty(out, groups, dtype=torch.long)
     codebooks = torch.empty(groups, n_centroids, sub_dim, dtype=weight.dtype)
