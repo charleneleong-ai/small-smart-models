@@ -116,6 +116,8 @@ def encode_eval(
     lattice: bool = typer.Option(
         False, help="Quantize to the E8 lattice instead of a learned codebook. --avg-bits then "
                     "acts as a target rate realized by per-tensor scale calibration."),
+    noise: bool = typer.Option(
+        False, help="Inject Gaussian noise matched to PQ's perturbation RMS (ablation baseline)."),
     importance_path: Path | None = typer.Option(
         None, help="Activation importance .pt from profile-activations."),
     hessian_path: Path | None = typer.Option(
@@ -144,7 +146,7 @@ def encode_eval(
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    from smart_quant.encode import quantize_experts
+    from smart_quant.encode import quantize_experts, noise_inject_experts
     from smart_quant.eval import load_causal_lm, run_task_battery, sliding_window_perplexity
 
     # dataset first, so a bad id fails fast rather than after the multi-minute model load
@@ -154,10 +156,13 @@ def encode_eval(
     freqs = torch.load(freqs_path, weights_only=True) if allocation == "expert" else None
     importance = torch.load(importance_path, weights_only=True) if importance_path else None
     hessians = torch.load(hessian_path, weights_only=True) if hessian_path else None
-    stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs, lattice=lattice,
-                             bits_lo=bits_lo, bits_hi=bits_hi, codebook_order=codebook_order,
-                             importance=importance, hessians=hessians, rounds=rounds,
-                             compensate=compensate)
+    if noise:
+        stats = noise_inject_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim)
+    else:
+        stats = quantize_experts(lm, avg_bits=avg_bits, sub_dim=sub_dim, freqs=freqs, lattice=lattice,
+                                 bits_lo=bits_lo, bits_hi=bits_hi, codebook_order=codebook_order,
+                                 importance=importance, hessians=hessians, rounds=rounds,
+                                 compensate=compensate)
     span = [round(min(s["bits_min"] for s in stats), 2), round(max(s["bits_max"] for s in stats), 2)]
 
     # Realized footprint: expert_bpw is the honest per-weight cost of the quantized experts
@@ -176,7 +181,7 @@ def encode_eval(
 
     row = {"label": label, "model": model, "allocation": allocation, "avg_bits": avg_bits,
            "sub_dim": 8 if lattice else sub_dim, "codebook_order": codebook_order,
-           "quantizer": "e8" if lattice else "pq",
+           "quantizer": "e8" if lattice else ("noise" if noise else "pq"),
            # derived from the artifact's rank, not a hand-typed flag: a mislabeled row would put
            # a data point on the wrong arm of the phase-7 ablation
            "importance": None if importance is None else (
