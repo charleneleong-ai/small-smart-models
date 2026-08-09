@@ -25,7 +25,8 @@ from smart_quant.compensate import compensated_quantize_fused, damped_inverse
 from smart_quant.expert_importance import bits_from_frequency, layer_index
 from smart_quant.lattice import quantize_e8_fused
 
-__all__ = ["layer_index", "centroids_for_bits", "quantize_fused_experts", "quantize_experts"]
+__all__ = ["layer_index", "centroids_for_bits", "quantize_fused_experts", "quantize_experts",
+           "noise_inject_experts"]
 
 
 def centroids_for_bits(bits: float, sub_dim: int, lo: int = 16, hi: int = 4096) -> int:
@@ -160,4 +161,51 @@ def quantize_experts(
         raise KeyError(
             "hessians supplied but no key matched any gate_up_proj layer. "
             "Expected integer layer-index keys, e.g. 0.")
+    return stats
+
+
+def noise_inject_experts(
+    model, avg_bits: float, sub_dim: int = 4, iters: int = 10,
+) -> list[dict]:
+    """Inject Gaussian noise into MoE expert weights, matched to PQ's perturbation RMS.
+
+    For each expert, this:
+    1. Fits a PQ codebook and measures the RMS of the quantization error (weight - recon)
+    2. Restores the original weight
+    3. Injects Gaussian noise with std = error_rms
+
+    This produces unstructured noise at the same magnitude as PQ, testing whether
+    regularization comes from noise magnitude (generic) or noise structure (learned codebook)."""
+    from smart_quant.codebook import pq_dequantize, residual_pq_quantize
+
+    stats = []
+    for name, module in model.named_modules():
+        if not type(module).__name__.endswith("Experts"):
+            continue
+        fused = [(pn, p) for pn, p in module.named_parameters(recurse=False) if p.dim() == 3]
+        if not fused:
+            continue
+        n_experts = fused[0][1].shape[0]
+        bits = torch.full((n_experts,), float(avg_bits))
+        layer_bits, layer_weights = 0.0, 0
+        with torch.no_grad():
+            for param_name, weight in fused:
+                # Step 1: PQ quantize to measure the error RMS
+                codes, codebooks = residual_pq_quantize(
+                    weight[0].float(), sub_dim, [centroids_for_bits(avg_bits, sub_dim)],
+                    iters=iters, max_fit=max(4096, 256))
+                recon = pq_dequantize(codes, codebooks).to(weight.dtype)
+                error_rms = (weight[0].float() - recon.float()).rms().item()
+
+                # Step 2: Inject Gaussian noise with matched RMS to all experts
+                noise = torch.randn_like(weight.float()) * error_rms
+                weight.copy_((weight.float() + noise).to(weight.dtype))
+
+                out, in_ = weight.shape[1], weight.shape[2]
+                layer_bits += pq_bpw(out, in_, sub_dim, [centroids_for_bits(avg_bits, sub_dim)]) * out * in_ * n_experts
+                layer_weights += out * in_ * n_experts
+        stats.append({"layer": name, "n_experts": n_experts,
+                      "bits_min": round(avg_bits, 2), "bits_max": round(avg_bits, 2),
+                      "quant_bits": layer_bits, "quant_weights": layer_weights,
+                      "noise_rms": error_rms})
     return stats
