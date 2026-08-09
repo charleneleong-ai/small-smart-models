@@ -195,7 +195,7 @@ def noise_inject_experts(
                     weight[0].float(), sub_dim, [centroids_for_bits(avg_bits, sub_dim)],
                     iters=iters, max_fit=max(4096, 256))
                 recon = pq_dequantize(codes, codebooks).to(weight.dtype)
-                error_rms = (weight[0].float() - recon.float()).rms().item()
+                error_rms = (weight[0].float() - recon.float()).pow(2).mean().sqrt().item()
 
                 # Step 2: Inject Gaussian noise with matched RMS to all experts
                 noise = torch.randn_like(weight.float()) * error_rms
