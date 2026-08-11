@@ -16,8 +16,8 @@ All PQ runs use `sub_dim=4`, uniform allocation, shared codebook, no compensatio
 | fp16 | fp16-gsm8k | **0.286** | 0.745 | 5.918 | baseline |
 | 1.00 | pq10-gsm8k | 0.168 | 0.476 | 21.954 | **broken** |
 | 1.25 | pq125-gsm8k | 0.480 | 0.632 | 12.119 | transition zone |
-| 1.50 | reg-150 | 0.705 | — | 8.641 | heavy quantization |
-| 1.75 | reg-175 | 0.766 | — | — | OOM on ppl (gsm8k only) |
+| 1.50 | reg-150 | 0.705 | 0.725 | 8.641 | heavy quantization |
+| 1.75 | pq175-uniform | 0.766 | — | 7.334 | gsm8k only |
 | 2.01 | pq20-uniform | **0.870** | 0.715 | 6.765 | **peak regularization** |
 | 2.54 | pq25-gsm8k | 0.857 | 0.730 | 6.214 | plateau |
 | 2.54 | gptq25 | 0.865 | 0.735 | 6.246 | GPTQ (learned codebook) |
@@ -26,6 +26,9 @@ All PQ runs use `sub_dim=4`, uniform allocation, shared codebook, no compensatio
 ## Analysis
 
 ### The curve
+
+See `experiments/bits-per-brain/regularization_curve.png` for the full 3-panel plot
+(perplexity, gsm8k, hellaswag vs bpw) logged to W&B.
 
 ```
 gsm8k
@@ -46,7 +49,7 @@ gsm8k
 0.20 |  * pq10                       * e8-25
      +----+----+----+----+----+----+----+----+----
      fp16 1.0  1.25 1.5  1.75 2.0  2.5  3.0  e8
-                         bpw
+                          bpw
 ```
 
 ### Key findings
@@ -64,9 +67,10 @@ gsm8k
    The model is degraded but functional — this is where signal loss overwhelms
    regularization gain.
 
-4. **Fades at 1.5 bpw.** At 1.5 bpw (0.705), the quantization noise is too aggressive —
-   the model loses more signal than it gains from regularization. The ppl degradation
-   (+46% vs fp16) confirms severe weight corruption.
+4. **Fades at 1.5 bpw.** At 1.5 bpw (0.705), regularization is still active but weaker.
+   hellaswag=0.725 (within 2pp of fp16's 0.745), so the model is still functional.
+   The ppl degradation (+46% vs fp16) confirms weight corruption, but the model
+   retains enough structure for reasoning.
 
 5. **E8 lattice doesn't benefit.** E8 at 2.5 bpw scores 0.220 — *worse* than fp16.
    This confirms the effect is specific to **learned codebooks** (PQ, GPTQ), not just
