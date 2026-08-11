@@ -70,7 +70,7 @@ def eval_model(
     # existing calls are unchanged; override to the fp16 base when scoring a GGUF.
     tok = AutoTokenizer.from_pretrained(tokenizer or model)
     text = "\n\n".join(load_dataset(dataset, config, split="test")["text"])
-    load_kwargs = {"dtype": "auto", "device_map": "cuda"}
+    load_kwargs = {"dtype": "auto", "device_map": "auto"}
     if gguf_file:
         # GGUF is dequantized on load, so a 35B build lands at ~70 GB in fp16 — close enough to an
         # 80 GB card that "auto" should be free to spill rather than OOM. fp32 would not fit at all.
@@ -152,7 +152,7 @@ def encode_eval(
     # dataset first, so a bad id fails fast rather than after the multi-minute model load
     tok = AutoTokenizer.from_pretrained(model)
     text = "\n\n".join(load_dataset(dataset, config, split="test")["text"])
-    lm = load_causal_lm(model, dtype="auto", device_map="cuda").eval()
+    lm = load_causal_lm(model, dtype="auto", device_map="auto").eval()
     freqs = torch.load(freqs_path, weights_only=True) if allocation == "expert" else None
     importance = torch.load(importance_path, weights_only=True) if importance_path else None
     hessians = torch.load(hessian_path, weights_only=True) if hessian_path else None
@@ -220,7 +220,7 @@ def load_for_calibration(model: str) -> tuple[Any, Any, Any, Any]:
     from transformers import AutoModel, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model)
-    lm = AutoModel.from_pretrained(model, torch_dtype="auto", device_map="cuda").eval()
+    lm = AutoModel.from_pretrained(model, torch_dtype="auto", device_map="auto").eval()
     return tok, lm, lm.config.get_text_config(), load_dataset(  # unwraps multimodal text_config
         "allenai/c4", "en", split="train", streaming=True)
 
