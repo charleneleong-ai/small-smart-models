@@ -1,0 +1,44 @@
+# Distillation study config
+# Usage: smart-quant cache-teacher --config configs/distillation.yaml
+
+teacher:
+  model: Qwen/Qwen3.6-35B-A3B
+  top_k: 100
+
+student:
+  model: Qwen/Qwen2.5-1.5B
+
+data:
+  dataset: allenai/c4
+  config: en
+  split: train
+  max_samples: 512
+  max_length: 2048
+
+cache:
+  shard_size: 1000
+  output_dir: experiments/teacher_logits
+
+training:
+  epochs: 3
+  batch_size: 4
+  learning_rate: 5e-5
+  temperature: 4.0
+  alpha: 0.7
+  warmup_ratio: 0.1
+  gradient_accumulation_steps: 4
+  save_steps: 500
+  logging_steps: 50
+
+eval:
+  tasks:
+    - arc_challenge
+    - hellaswag
+    - winogrande
+    - gsm8k
+    - mmlu
+  limit: null
+
+output:
+  student_dir: experiments/distilled-models/student-1.5b
+  results: experiments/distillation/results.jsonl

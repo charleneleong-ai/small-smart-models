@@ -315,5 +315,162 @@ def profile_hessian(
     console.print(f"profiled {len(hess)} layer Hessians over {calib_rows} rows → {out}")
 
 
+@app.command("cache-teacher")
+def cache_teacher_cmd(
+    model: str = typer.Option("Qwen/Qwen3.6-35B-A3B", help="Teacher model HF repo id or local path."),
+    out: Path = typer.Option(Path("experiments/teacher_logits"), help="Output directory for cached logits."),
+    dataset: str = typer.Option("allenai/c4", help="HF dataset repo id."),
+    config: str = typer.Option("en", help="Dataset config."),
+    split: str = typer.Option("train", help="Dataset split."),
+    max_length: int = typer.Option(2048),
+    shard_size: int = typer.Option(1000),
+    top_k: int = typer.Option(100, help="Keep only top-K logits per token."),
+    max_samples: int = typer.Option(512, help="Max samples to process."),
+) -> None:
+    """Cache teacher model's top-K logits for offline distillation.
+
+    Phase 1 of the distillation pipeline. Runs the teacher over a calibration set
+    and caches the sparse logits to disk for student training.
+    """
+    from smart_quant.distill import cache_teacher_logits
+
+    console.print(f"[bold]Caching teacher logits from {model}[/bold]")
+    console.print(f"  Dataset: {dataset}:{config} ({split})")
+    console.print(f"  Max samples: {max_samples}")
+    console.print(f"  Top-K: {top_k}")
+
+    cache_teacher_logits(
+        model_id=model,
+        output_dir=out,
+        dataset_name=dataset,
+        dataset_config=config,
+        split=split,
+        max_length=max_length,
+        shard_size=shard_size,
+        top_k=top_k,
+        max_samples=max_samples,
+    )
+
+    console.print(f"[bold green]Teacher logits cached to {out}[/bold green]")
+
+
+@app.command("distill")
+def distill_cmd(
+    student: str = typer.Option("Qwen/Qwen2.5-1.5B", help="Student model HF repo id or local path."),
+    cache_dir: Path = typer.Option(Path("experiments/teacher_logits"), help="Directory with cached teacher logits."),
+    out: Path = typer.Option(Path("experiments/distilled-models/student-1.5b"), help="Output directory."),
+    epochs: int = typer.Option(3),
+    batch_size: int = typer.Option(4),
+    learning_rate: float = typer.Option(5e-5),
+    temperature: float = typer.Option(4.0, help="Distillation temperature."),
+    alpha: float = typer.Option(0.7, help="Weight for distillation loss (1-alpha for hard labels)."),
+    max_length: int = typer.Option(2048),
+    warmup_ratio: float = typer.Option(0.1),
+    gradient_accumulation_steps: int = typer.Option(4),
+    save_steps: int = typer.Option(500),
+    logging_steps: int = typer.Option(50),
+    wandb: bool = typer.Option(False, help="Log metrics to Weights & Biases."),
+    wandb_project: str = typer.Option("small-smart-models"),
+) -> None:
+    """Train student model against cached teacher logits.
+
+    Phase 2 of the distillation pipeline. Loads cached teacher logits and trains
+    a smaller student model using knowledge distillation.
+    """
+    from smart_quant.distill import train_student
+
+    console.print(f"[bold]Training student {student} with distillation[/bold]")
+    console.print(f"  Temperature: {temperature}")
+    console.print(f"  Alpha: {alpha}")
+    console.print(f"  Epochs: {epochs}")
+    console.print(f"  LR: {learning_rate}")
+
+    train_student(
+        student_id=student,
+        cache_dir=cache_dir,
+        output_dir=out,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        temperature=temperature,
+        alpha=alpha,
+        max_length=max_length,
+        warmup_ratio=warmup_ratio,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        save_steps=save_steps,
+        logging_steps=logging_steps,
+        wandb=wandb,
+        wandb_project=wandb_project,
+    )
+
+    console.print(f"[bold green]Student trained and saved to {out}[/bold green]")
+
+
+@app.command("distill-eval")
+def distill_eval_cmd(
+    model: str = typer.Option(..., help="Path to distilled student model."),
+    teacher: str = typer.Option("Qwen/Qwen3.6-35B-A3B", help="Teacher model for comparison."),
+    label: str = typer.Option(..., help="Row label for results.jsonl."),
+    tasks: str = typer.Option("arc_challenge,hellaswag,winogrande,gsm8k,mmlu",
+                              help="Comma-separated lm-eval tasks."),
+    limit: int = typer.Option(None, help="Per-task sample limit."),
+    dataset: str = typer.Option("Salesforce/wikitext"),
+    config: str = typer.Option("wikitext-2-raw-v1"),
+    max_length: int = typer.Option(4096),
+    stride: int = typer.Option(2048),
+    out: Path = typer.Option(Path("experiments/distillation/results.jsonl")),
+    wandb: bool = typer.Option(False, help="Log metrics to Weights & Biases."),
+    wandb_project: str = typer.Option("small-smart-models"),
+) -> None:
+    """Evaluate a distilled student model against its teacher.
+
+    Phase 3 of the distillation pipeline. Runs the capability battery on the
+    student and compares with teacher performance.
+    """
+    import json
+
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    from smart_quant.eval import load_causal_lm, run_task_battery, sliding_window_perplexity
+
+    console.print(f"[bold]Evaluating distilled model: {model}[/bold]")
+
+    # Load student
+    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    text = "\n\n".join(load_dataset(dataset, config, split="test")["text"])
+    lm = load_causal_lm(model, dtype="auto", device_map="auto").eval()
+
+    # Evaluate
+    ppl = sliding_window_perplexity(lm, tok, text, max_length, stride, "cuda")
+    task_acc = run_task_battery(lm, tok, [t.strip() for t in tasks.split(",")], limit)
+
+    # Save results
+    row = {
+        "label": label,
+        "model": model,
+        "teacher": teacher,
+        "wikitext_ppl": round(ppl, 4),
+        "dataset": f"{dataset}:{config}",
+        "task_acc": task_acc,
+    }
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+    console.print(f"[bold]{label}[/bold]  wikitext-2 ppl = [bold]{ppl:.4f}[/bold]")
+    for task, acc in task_acc.items():
+        console.print(f"  {task}: {acc:.4f}")
+
+    if wandb:
+        import wandb
+        wandb.init(project=wandb_project, name=label, config=row)
+        log_row = {"wikitext_ppl": round(ppl, 4)}
+        log_row.update({f"acc/{k}": v for k, v in task_acc.items()})
+        wandb.log(log_row)
+        wandb.finish()
+
+
 if __name__ == "__main__":
     app()
