@@ -92,21 +92,24 @@ class CachedLogitsDataset(Dataset):
         input_ids = data["input_ids"][offset, :length]
         logits = data["logits"][offset, :length, :]
 
-        # Project teacher logits to student vocab if needed
+        # Project teacher logits AND input_ids to student vocab if needed
         if self.vocab_proj is not None:
             # vocab_proj: [teacher_vocab] long tensor mapping teacher→student token IDs
-            # logits: [seq_len, teacher_vocab] → scatter into [seq_len, student_vocab]
-            teacher_logits_vocab = logits.size(-1)
-            student_vocab = int(self.vocab_proj.max()) + 1
-            projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
+            proj = self.vocab_proj
 
-            # Map teacher logits positions to student vocab IDs
-            # vocab_proj covers teacher_tok.vocab_size; beyond that, map to token 0
-            proj = self.vocab_proj.to(logits.device)
-            if proj.size(0) < teacher_logits_vocab:
-                pad = torch.zeros(teacher_logits_vocab - proj.size(0), dtype=proj.dtype, device=proj.device)
-                proj = torch.cat([proj, pad])
-            projected.scatter_add_(-1, proj.expand_as(logits), logits)
+            # Remap input_ids: teacher token ID → student token ID
+            safe_ids = input_ids.clamp(0, proj.size(0) - 1)
+            input_ids = proj[safe_ids]
+
+            # Remap logits: scatter teacher logits into student vocab
+            teacher_logits_vocab = logits.size(-1)
+            student_vocab = int(proj.max()) + 1
+            projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
+            proj_expanded = proj.to(logits.device)
+            if proj_expanded.size(0) < teacher_logits_vocab:
+                pad = torch.zeros(teacher_logits_vocab - proj_expanded.size(0), dtype=proj_expanded.dtype, device=proj_expanded.device)
+                proj_expanded = torch.cat([proj_expanded, pad])
+            projected.scatter_add_(-1, proj_expanded.expand_as(logits), logits)
             logits = projected
 
         # Sparsify to top-k logits
