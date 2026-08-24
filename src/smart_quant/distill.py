@@ -144,8 +144,8 @@ def cache_teacher_logits(
             mask = logits < threshold
             logits = logits.masked_fill(mask, float("-inf"))
 
-        shard_data["input_ids"].append(enc["input_ids"].cpu())
-        shard_data["logits"].append(logits.cpu())
+        shard_data["input_ids"].append(enc["input_ids"].cpu().squeeze(0))  # [seq_len]
+        shard_data["logits"].append(logits.cpu().squeeze(0))              # [seq_len, vocab]
 
         # Save shard when full or every 100 samples to cap RAM
         effective_shard = min(shard_size, 100) if max_samples and max_samples < shard_size else shard_size
@@ -157,8 +157,8 @@ def cache_teacher_logits(
             padded_ids = torch.zeros(len(shard_data["input_ids"]), batch_max, dtype=torch.long)
             padded_logits = torch.zeros(len(shard_data["logits"]), batch_max, shard_data["logits"][0].size(-1), dtype=torch.float16)
             for j, (ids, lg) in enumerate(zip(shard_data["input_ids"], shard_data["logits"])):
-                padded_ids[j, :ids.size(0)] = ids.squeeze(0)
-                padded_logits[j, :lg.size(0)] = lg.squeeze(0)
+                padded_ids[j, :ids.size(0)] = ids
+                padded_logits[j, :lg.size(0)] = lg
 
             torch.save({
                 "input_ids": padded_ids,
@@ -187,8 +187,8 @@ def cache_teacher_logits(
         padded_ids = torch.zeros(len(shard_data["input_ids"]), batch_max, dtype=torch.long)
         padded_logits = torch.zeros(len(shard_data["logits"]), batch_max, shard_data["logits"][0].size(-1), dtype=torch.float16)
         for j, (ids, lg) in enumerate(zip(shard_data["input_ids"], shard_data["logits"])):
-            padded_ids[j, :ids.size(0)] = ids.squeeze(0)
-            padded_logits[j, :lg.size(0)] = lg.squeeze(0)
+            padded_ids[j, :ids.size(0)] = ids
+            padded_logits[j, :lg.size(0)] = lg
 
         torch.save({
             "input_ids": padded_ids,
