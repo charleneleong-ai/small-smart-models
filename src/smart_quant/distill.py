@@ -108,7 +108,7 @@ def cache_teacher_logits(
     # Load teacher using the fallback-aware loader
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = load_causal_lm(model_id, dtype=torch.float16, device_map=device,
-                           trust_remote_code=True).eval()
+                           trust_remote_code=True, low_cpu_mem_usage=True).eval()
 
     # Load dataset (streaming to avoid full download)
     ds = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
@@ -146,6 +146,8 @@ def cache_teacher_logits(
 
         shard_data["input_ids"].append(enc["input_ids"].cpu().squeeze(0))  # [seq_len]
         shard_data["logits"].append(logits.cpu().squeeze(0))              # [seq_len, vocab]
+        del enc, outputs, logits
+        torch.cuda.empty_cache()
 
         # Save shard when full or every 100 samples to cap RAM
         effective_shard = min(shard_size, 100) if max_samples and max_samples < shard_size else shard_size
