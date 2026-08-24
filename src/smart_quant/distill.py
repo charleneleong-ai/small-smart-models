@@ -95,6 +95,8 @@ def cache_teacher_logits(
     Returns:
         Path to output directory
     """
+    from itertools import islice
+
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
@@ -108,17 +110,18 @@ def cache_teacher_logits(
     model = load_causal_lm(model_id, dtype=torch.float16, device_map=device,
                            trust_remote_code=True).eval()
 
-    # Load dataset
-    ds = load_dataset(dataset_name, dataset_config, split=split)
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
+    # Load dataset (streaming to avoid full download)
+    ds = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
 
     # Cache logits
     index_entries = []
     shard_idx = 0
     shard_data = {"input_ids": [], "logits": []}
 
-    for i, sample in enumerate(ds):
+    # Use islice for streaming mode to limit samples
+    sample_iter = islice(ds, max_samples) if max_samples else ds
+
+    for i, sample in enumerate(sample_iter):
         text = sample.get("text", sample.get("content", ""))
         if not text:
             continue
