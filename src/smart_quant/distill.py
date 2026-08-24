@@ -371,8 +371,9 @@ def train_student(
     model.enable_input_require_grads()
 
     # Load dataset
+    student_vocab_size = model.config.vocab_size
     dataset = CachedLogitsDataset(cache_dir, max_length=max_length, vocab_proj=vocab_proj,
-                                  student_vocab_size=tokenizer.vocab_size)
+                                  student_vocab_size=student_vocab_size)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
