@@ -96,19 +96,17 @@ def cache_teacher_logits(
         Path to output directory
     """
     from datasets import load_dataset
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+
+    from smart_quant.eval import load_causal_lm
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load teacher
+    # Load teacher using the fallback-aware loader
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype=torch.float16,
-        device_map=device,
-        trust_remote_code=True,
-    ).eval()
+    model = load_causal_lm(model_id, dtype=torch.float16, device_map=device,
+                           trust_remote_code=True).eval()
 
     # Load dataset
     ds = load_dataset(dataset_name, dataset_config, split=split)
@@ -247,22 +245,19 @@ def train_student(
         Path to output directory
     """
     from transformers import (
-        AutoModelForCausalLM,
         AutoTokenizer,
         get_linear_schedule_with_warmup,
     )
 
+    from smart_quant.eval import load_causal_lm
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load student
+    # Load student using the fallback-aware loader
     tokenizer = AutoTokenizer.from_pretrained(student_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        student_id,
-        dtype=torch.float16,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    model = load_causal_lm(student_id, dtype=torch.float16, device_map=device,
+                           trust_remote_code=True)
 
     # Enable gradient checkpointing for memory efficiency
     model.gradient_checkpointing_enable()
