@@ -21,15 +21,15 @@ def build_vocab_projection(
     student_model_id: str,
     device: str = "cpu",
 ) -> torch.Tensor:
-    """Build a sparse projection matrix mapping teacher vocab → student vocab.
+    """Build a teacher→student vocab mapping as a 1-D lookup tensor.
 
     For each teacher token, decode it to text and re-encode with the student
-    tokenizer. If a teacher token maps to exactly one student token, the
-    probability mass transfers directly. Multi-token expansions go to the
-    first sub-token (approximate but preserves most mass).
+    tokenizer. The resulting student token ID becomes the mapping target.
+    Teacher tokens that map to multiple student tokens are assigned to the
+    first sub-token (approximate but preserves most probability mass).
 
     Returns:
-        Tensor of shape [teacher_vocab, student_vocab] (sparse-ish, fp32).
+        Long tensor of shape [teacher_vocab] where entry[i] = student token ID.
     """
     from transformers import AutoTokenizer
 
@@ -39,17 +39,17 @@ def build_vocab_projection(
     teacher_vocab = teacher_tok.vocab_size
     student_vocab = student_tok.vocab_size
 
-    proj = torch.zeros(teacher_vocab, student_vocab, dtype=torch.float32)
+    mapping = torch.zeros(teacher_vocab, dtype=torch.long)
     mapped = 0
     for t_id in range(teacher_vocab):
         token_str = teacher_tok.decode([t_id])
         s_ids = student_tok.encode(token_str, add_special_tokens=False)
         if s_ids:
-            proj[t_id, s_ids[0]] = 1.0
+            mapping[t_id] = s_ids[0]
             mapped += 1
 
     print(f"Vocab projection: {mapped}/{teacher_vocab} teacher tokens mapped to student vocab")
-    return proj
+    return mapping
 
 
 class CachedLogitsDataset(Dataset):
@@ -94,8 +94,12 @@ class CachedLogitsDataset(Dataset):
 
         # Project teacher logits to student vocab if needed
         if self.vocab_proj is not None:
-            # logits: [seq_len, teacher_vocab] → [seq_len, student_vocab]
-            logits = logits.to(self.vocab_proj.dtype) @ self.vocab_proj.to(logits.device)
+            # vocab_proj: [teacher_vocab] long tensor mapping teacher→student token IDs
+            # logits: [seq_len, teacher_vocab] → scatter into [seq_len, student_vocab]
+            student_vocab = int(self.vocab_proj.max()) + 1
+            projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
+            projected.scatter_add_(-1, self.vocab_proj.to(logits.device).expand_as(logits), logits)
+            logits = projected
 
         # Sparsify to top-k logits
         if self.top_k < logits.size(-1):
@@ -337,13 +341,17 @@ def train_student(
 
     # Build vocab projection if teacher and student have different vocabs
     vocab_proj = None
-    if teacher_model_id:
+    saved_proj_path = cache_dir / "vocab_proj.pt"
+    if saved_proj_path.exists():
+        vocab_proj = torch.load(saved_proj_path, weights_only=True)
+        print(f"Loaded saved vocab projection from {saved_proj_path}")
+    elif teacher_model_id:
         teacher_tok = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
         if teacher_tok.vocab_size != tokenizer.vocab_size:
             print(f"Building vocab projection: teacher {teacher_tok.vocab_size} → student {tokenizer.vocab_size}")
             vocab_proj = build_vocab_projection(teacher_model_id, student_id, device="cpu")
-            # Save projection for reuse
-            torch.save(vocab_proj, output_dir / "vocab_proj.pt")
+            torch.save(vocab_proj, saved_proj_path)
+            print(f"Saved vocab projection to {saved_proj_path}")
 
     # Enable gradient checkpointing for memory efficiency
     model.gradient_checkpointing_enable()
