@@ -151,9 +151,18 @@ def cache_teacher_logits(
         effective_shard = min(shard_size, 100) if max_samples and max_samples < shard_size else shard_size
         if len(shard_data["input_ids"]) >= effective_shard:
             shard_path = output_dir / f"shard_{shard_idx:04d}.pt"
+
+            # Pad to max_length in this batch for uniform tensor sizes
+            batch_max = max(x.size(0) for x in shard_data["input_ids"])
+            padded_ids = torch.zeros(len(shard_data["input_ids"]), batch_max, dtype=torch.long)
+            padded_logits = torch.zeros(len(shard_data["logits"]), batch_max, shard_data["logits"][0].size(-1), dtype=torch.float16)
+            for j, (ids, lg) in enumerate(zip(shard_data["input_ids"], shard_data["logits"])):
+                padded_ids[j, :ids.size(0)] = ids.squeeze(0)
+                padded_logits[j, :lg.size(0)] = lg.squeeze(0)
+
             torch.save({
-                "input_ids": torch.cat(shard_data["input_ids"], dim=0),
-                "logits": torch.cat(shard_data["logits"], dim=0),
+                "input_ids": padded_ids,
+                "logits": padded_logits,
             }, shard_path)
 
             for j in range(len(shard_data["input_ids"])):
@@ -173,9 +182,17 @@ def cache_teacher_logits(
     # Save final partial shard
     if shard_data["input_ids"]:
         shard_path = output_dir / f"shard_{shard_idx:04d}.pt"
+
+        batch_max = max(x.size(0) for x in shard_data["input_ids"])
+        padded_ids = torch.zeros(len(shard_data["input_ids"]), batch_max, dtype=torch.long)
+        padded_logits = torch.zeros(len(shard_data["logits"]), batch_max, shard_data["logits"][0].size(-1), dtype=torch.float16)
+        for j, (ids, lg) in enumerate(zip(shard_data["input_ids"], shard_data["logits"])):
+            padded_ids[j, :ids.size(0)] = ids.squeeze(0)
+            padded_logits[j, :lg.size(0)] = lg.squeeze(0)
+
         torch.save({
-            "input_ids": torch.cat(shard_data["input_ids"], dim=0),
-            "logits": torch.cat(shard_data["logits"], dim=0),
+            "input_ids": padded_ids,
+            "logits": padded_logits,
         }, shard_path)
 
         for j in range(len(shard_data["input_ids"])):
