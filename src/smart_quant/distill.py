@@ -135,7 +135,7 @@ def cache_teacher_logits(
 
         with torch.no_grad():
             outputs = model(**enc)
-            logits = outputs.logits.float()  # Keep in fp32 for precision
+            logits = outputs.logits.half()  # fp16 to save CPU RAM
 
         # Sparsify to top-k
         if top_k < logits.size(-1):
@@ -147,8 +147,9 @@ def cache_teacher_logits(
         shard_data["input_ids"].append(enc["input_ids"].cpu())
         shard_data["logits"].append(logits.cpu())
 
-        # Save shard when full
-        if len(shard_data["input_ids"]) >= shard_size:
+        # Save shard when full or every 100 samples to cap RAM
+        effective_shard = min(shard_size, 100) if max_samples and max_samples < shard_size else shard_size
+        if len(shard_data["input_ids"]) >= effective_shard:
             shard_path = output_dir / f"shard_{shard_idx:04d}.pt"
             torch.save({
                 "input_ids": torch.cat(shard_data["input_ids"], dim=0),
@@ -164,6 +165,7 @@ def cache_teacher_logits(
 
             shard_data = {"input_ids": [], "logits": []}
             shard_idx += 1
+            import gc; gc.collect()
 
         if (i + 1) % 100 == 0:
             print(f"  Processed {i + 1} samples, {shard_idx} shards saved")
