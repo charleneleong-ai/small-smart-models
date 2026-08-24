@@ -96,10 +96,18 @@ class CachedLogitsDataset(Dataset):
         if self.vocab_proj is not None:
             # vocab_proj: [teacher_vocab] long tensor mapping teacher→student token IDs
             # logits: [seq_len, teacher_vocab] → scatter into [seq_len, student_vocab]
-            student_vocab = int(self.vocab_proj.max()) + 1
-            projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
-            projected.scatter_add_(-1, self.vocab_proj.to(logits.device).expand_as(logits), logits)
-            logits = projected
+    teacher_logits_vocab = logits.size(-1)
+    student_vocab = int(self.vocab_proj.max()) + 1
+    projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
+
+    # Map teacher logits positions to student vocab IDs
+    # vocab_proj covers teacher_tok.vocab_size; beyond that, map to token 0
+    proj = self.vocab_proj.to(logits.device)
+    if proj.size(0) < teacher_logits_vocab:
+        pad = torch.zeros(teacher_logits_vocab - proj.size(0), dtype=proj.dtype, device=proj.device)
+        proj = torch.cat([proj, pad])
+    projected.scatter_add_(-1, proj.expand_as(logits), logits)
+    logits = projected
 
         # Sparsify to top-k logits
         if self.top_k < logits.size(-1):
