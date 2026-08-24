@@ -1,11 +1,12 @@
 """Knowledge distillation: cache teacher logits, train student against cached targets.
 
 Phase 1: Cache teacher logits (offline KD)
-Phase 2: Train student against cached logits
+Phase 2: Train student against cached logits (with vocab projection if teacher != student vocab)
 Phase 3: Evaluate distilled student
 """
 from __future__ import annotations
 
+import gc
 import json
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,42 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+
+def build_vocab_projection(
+    teacher_model_id: str,
+    student_model_id: str,
+    device: str = "cpu",
+) -> torch.Tensor:
+    """Build a sparse projection matrix mapping teacher vocab → student vocab.
+
+    For each teacher token, decode it to text and re-encode with the student
+    tokenizer. If a teacher token maps to exactly one student token, the
+    probability mass transfers directly. Multi-token expansions go to the
+    first sub-token (approximate but preserves most mass).
+
+    Returns:
+        Tensor of shape [teacher_vocab, student_vocab] (sparse-ish, fp32).
+    """
+    from transformers import AutoTokenizer
+
+    teacher_tok = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
+    student_tok = AutoTokenizer.from_pretrained(student_model_id, trust_remote_code=True)
+
+    teacher_vocab = teacher_tok.vocab_size
+    student_vocab = student_tok.vocab_size
+
+    proj = torch.zeros(teacher_vocab, student_vocab, dtype=torch.float32)
+    mapped = 0
+    for t_id in range(teacher_vocab):
+        token_str = teacher_tok.decode([t_id])
+        s_ids = student_tok.encode(token_str, add_special_tokens=False)
+        if s_ids:
+            proj[t_id, s_ids[0]] = 1.0
+            mapped += 1
+
+    print(f"Vocab projection: {mapped}/{teacher_vocab} teacher tokens mapped to student vocab")
+    return proj
 
 
 class CachedLogitsDataset(Dataset):
@@ -23,10 +60,12 @@ class CachedLogitsDataset(Dataset):
         cache_dir: Path,
         max_length: int = 2048,
         top_k: int = 100,
+        vocab_proj: torch.Tensor | None = None,
     ):
         self.cache_dir = Path(cache_dir)
         self.max_length = max_length
         self.top_k = top_k
+        self.vocab_proj = vocab_proj  # [teacher_vocab, student_vocab] or None
 
         # Load index file
         index_path = self.cache_dir / "index.jsonl"
@@ -52,6 +91,11 @@ class CachedLogitsDataset(Dataset):
         # Index into batch dimension to get single sample
         input_ids = data["input_ids"][offset, :length]
         logits = data["logits"][offset, :length, :]
+
+        # Project teacher logits to student vocab if needed
+        if self.vocab_proj is not None:
+            # logits: [seq_len, teacher_vocab] → [seq_len, student_vocab]
+            logits = logits.to(self.vocab_proj.dtype) @ self.vocab_proj.to(logits.device)
 
         # Sparsify to top-k logits
         if self.top_k < logits.size(-1):
@@ -122,7 +166,7 @@ def cache_teacher_logits(
     # Cache logits
     index_entries = []
     shard_idx = 0
-    shard_data = {"input_ids": [], "logits": []}
+    shard_data: dict[str, list[torch.Tensor]] = {"input_ids": [], "logits": []}
 
     # Use islice for streaming mode to limit samples
     sample_iter = islice(ds, max_samples) if max_samples else ds
@@ -182,7 +226,7 @@ def cache_teacher_logits(
 
             shard_data = {"input_ids": [], "logits": []}
             shard_idx += 1
-            import gc; gc.collect()
+            gc.collect()
 
         if (i + 1) % 100 == 0:
             print(f"  Processed {i + 1} samples, {shard_idx} shards saved")
@@ -235,6 +279,7 @@ def train_student(
     student_id: str,
     cache_dir: Path,
     output_dir: Path,
+    teacher_model_id: str | None = None,
     epochs: int = 3,
     batch_size: int = 8,
     learning_rate: float = 5e-5,
@@ -256,6 +301,7 @@ def train_student(
         student_id: HuggingFace model ID or local path for student
         cache_dir: Directory with cached teacher logits
         output_dir: Where to save trained student
+        teacher_model_id: Teacher model ID (for vocab projection if vocab differs)
         epochs: Number of training epochs
         batch_size: Batch size per GPU
         learning_rate: Peak learning rate
@@ -289,17 +335,27 @@ def train_student(
     model = load_causal_lm(student_id, dtype=torch.float16, device_map=device,
                            trust_remote_code=True)
 
+    # Build vocab projection if teacher and student have different vocabs
+    vocab_proj = None
+    if teacher_model_id:
+        teacher_tok = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
+        if teacher_tok.vocab_size != tokenizer.vocab_size:
+            print(f"Building vocab projection: teacher {teacher_tok.vocab_size} → student {tokenizer.vocab_size}")
+            vocab_proj = build_vocab_projection(teacher_model_id, student_id, device="cpu")
+            # Save projection for reuse
+            torch.save(vocab_proj, output_dir / "vocab_proj.pt")
+
     # Enable gradient checkpointing for memory efficiency
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
 
     # Load dataset
-    dataset = CachedLogitsDataset(cache_dir, max_length=max_length)
+    dataset = CachedLogitsDataset(cache_dir, max_length=max_length, vocab_proj=vocab_proj)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
     )
 
@@ -325,7 +381,8 @@ def train_student(
     if wandb:
         import wandb
         wandb.init(project=wandb_project, name=f"distill-{student_id.split('/')[-1]}",
-                   config={"student": student_id, "temperature": temperature, "alpha": alpha,
+                   config={"student": student_id, "teacher": teacher_model_id,
+                           "temperature": temperature, "alpha": alpha,
                            "lr": learning_rate, "epochs": epochs})
 
     # Training loop
@@ -407,6 +464,7 @@ def train_student(
     # Save training config
     config = {
         "student_id": student_id,
+        "teacher_model_id": teacher_model_id,
         "cache_dir": str(cache_dir),
         "epochs": epochs,
         "batch_size": batch_size,

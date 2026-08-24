@@ -356,7 +356,8 @@ def cache_teacher_cmd(
 
 @app.command("distill")
 def distill_cmd(
-    student: str = typer.Option("Qwen/Qwen2.5-1.5B", help="Student model HF repo id or local path."),
+    student: str = typer.Option("Qwen/Qwen3-0.6B", help="Student model HF repo id or local path."),
+    teacher_model: str = typer.Option("Qwen/Qwen3.6-35B-A3B", help="Teacher model ID for vocab projection."),
     cache_dir: Path = typer.Option(Path("experiments/teacher_logits"), help="Directory with cached teacher logits."),
     out: Path = typer.Option(Path("experiments/distilled-models/student-1.5b"), help="Output directory."),
     epochs: int = typer.Option(3),
@@ -389,6 +390,7 @@ def distill_cmd(
         student_id=student,
         cache_dir=cache_dir,
         output_dir=out,
+        teacher_model_id=teacher_model,
         epochs=epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
