@@ -61,11 +61,13 @@ class CachedLogitsDataset(Dataset):
         max_length: int = 2048,
         top_k: int = 100,
         vocab_proj: torch.Tensor | None = None,
+        student_vocab_size: int | None = None,
     ):
         self.cache_dir = Path(cache_dir)
         self.max_length = max_length
         self.top_k = top_k
-        self.vocab_proj = vocab_proj  # [teacher_vocab, student_vocab] or None
+        self.vocab_proj = vocab_proj  # [teacher_vocab] long mapping or None
+        self.student_vocab_size = student_vocab_size
 
         # Load index file
         index_path = self.cache_dir / "index.jsonl"
@@ -103,7 +105,7 @@ class CachedLogitsDataset(Dataset):
 
             # Remap logits: scatter teacher logits into student vocab
             teacher_logits_vocab = logits.size(-1)
-            student_vocab = int(proj.max()) + 1
+            student_vocab = self.student_vocab_size or (int(proj.max()) + 1)
             projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
             proj_expanded = proj.to(logits.device)
             if proj_expanded.size(0) < teacher_logits_vocab:
@@ -369,7 +371,8 @@ def train_student(
     model.enable_input_require_grads()
 
     # Load dataset
-    dataset = CachedLogitsDataset(cache_dir, max_length=max_length, vocab_proj=vocab_proj)
+    dataset = CachedLogitsDataset(cache_dir, max_length=max_length, vocab_proj=vocab_proj,
+                                  student_vocab_size=tokenizer.vocab_size)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
