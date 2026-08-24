@@ -166,7 +166,7 @@ def cache_teacher_logits(
             shard_idx += 1
 
         if (i + 1) % 100 == 0:
-            print(f"  Processed {i + 1}/{len(ds)} samples, {shard_idx} shards saved")
+            print(f"  Processed {i + 1} samples, {shard_idx} shards saved")
 
     # Save final partial shard
     if shard_data["input_ids"]:
