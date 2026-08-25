@@ -93,13 +93,13 @@ def eval_model(
     console.print(f"[bold]{label}[/bold]  wikitext-2 ppl = [bold]{ppl:.4f}[/bold]  ->  {out}")
 
     if wandb:
-        import wandb
-        wandb.init(project=wandb_project, name=label, config=row)
+        import trackio
+        trackio.init(project=wandb_project, name=label, config=row)
         log_row = {"wikitext_ppl": round(ppl, 4)}
         if task_acc:
             log_row.update({f"acc/{k}": v for k, v in task_acc.items()})
-        wandb.log(log_row)
-        wandb.finish()
+        trackio.log(log_row)
+        trackio.finish()
 
 
 @app.command("encode-eval")
@@ -200,8 +200,8 @@ def encode_eval(
                   f"wikitext ppl = [bold]{ppl:.4f}[/bold]  ->  {out}")
 
     if wandb:
-        import wandb
-        wandb.init(project=wandb_project, name=label, config=row)
+        import trackio
+        trackio.init(project=wandb_project, name=label, config=row)
         log_row = {
             "wikitext_ppl": round(ppl, 4),
             "expert_bpw": round(expert_bpw, 3),
@@ -209,8 +209,8 @@ def encode_eval(
         }
         if task_acc:
             log_row.update({f"acc/{k}": v for k, v in task_acc.items()})
-        wandb.log(log_row)
-        wandb.finish()
+        trackio.log(log_row)
+        trackio.finish()
 
 
 def load_for_calibration(model: str) -> tuple[Any, Any, Any, Any]:
@@ -466,12 +466,12 @@ def distill_eval_cmd(
         console.print(f"  {task}: {acc:.4f}")
 
     if wandb:
-        import wandb
-        wandb.init(project=wandb_project, name=label, config=row)
+        import trackio
+        trackio.init(project=wandb_project, name=label, config=row)
         log_row = {"wikitext_ppl": round(ppl, 4)}
         log_row.update({f"acc/{k}": v for k, v in task_acc.items()})
-        wandb.log(log_row)
-        wandb.finish()
+        trackio.log(log_row)
+        trackio.finish()
 
 
 if __name__ == "__main__":

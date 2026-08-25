@@ -473,11 +473,11 @@ def train_student(
     )
 
     if wandb:
-        import wandb
-        wandb.init(project=wandb_project, name=f"distill-{student_id.split('/')[-1]}",
-                   config={"student": student_id, "teacher": teacher_model_id,
-                           "temperature": temperature, "alpha": alpha,
-                           "lr": learning_rate, "epochs": epochs})
+        import trackio
+        trackio.init(project=wandb_project, name=f"distill-{student_id.split('/')[-1]}",
+                     config={"student": student_id, "teacher": teacher_model_id,
+                             "temperature": temperature, "alpha": alpha,
+                             "lr": learning_rate, "epochs": epochs})
 
     model.train()
     global_step = 0
@@ -566,8 +566,8 @@ def train_student(
                     print(f"  Step {global_step}/{total_steps} | Loss: {avg_loss:.4f} | LR: {lr:.2e}")
 
                     if wandb:
-                        import wandb
-                        wandb.log({
+                        import trackio
+                        trackio.log({
                             "train/loss": avg_loss,
                             "train/learning_rate": lr,
                             "train/epoch": epoch + batch_idx / len(dataloader),
@@ -603,8 +603,8 @@ def train_student(
         json.dump(config, f, indent=2)
 
     if wandb:
-        import wandb
-        wandb.finish()
+        import trackio
+        trackio.finish()
 
     print(f"Training complete. Model saved to {output_dir}")
     return output_dir
