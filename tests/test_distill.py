@@ -24,10 +24,12 @@ def mock_cache_dir(tmp_path: Path) -> Path:
     logit_indices = torch.randint(0, vocab_size, (batch_size, seq_len, top_k))
 
     shard_path = cache_dir / "shard_0000.pt"
+    texts = [f"Sample text {i} for testing distillation pipeline" for i in range(batch_size)]
     torch.save({
         "input_ids": input_ids,
         "logit_values": logit_values.half(),
         "logit_indices": logit_indices.int(),
+        "text": texts,
     }, shard_path)
 
     index_entries = []

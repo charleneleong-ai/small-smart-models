@@ -116,18 +116,21 @@ class CachedLogitsDataset(Dataset):
     """Dataset of cached teacher logits (sparse top-k format) in teacher vocab space.
 
     Each shard stores:
-        input_ids:  [N, S] long
+        input_ids:  [N, S] long (teacher tokenizer — unused at training time)
         logit_values:  [N, S, k] fp16  (top-k values)
         logit_indices: [N, S, k] int32 (top-k positions in TEACHER vocab)
+        text: list[str] — original text, re-tokenized with student tokenizer at load time
     """
 
     def __init__(
         self,
         cache_dir: Path,
         max_length: int = 2048,
+        student_tokenizer=None,
     ):
         self.cache_dir = Path(cache_dir)
         self.max_length = max_length
+        self.student_tokenizer = student_tokenizer
 
         index_path = self.cache_dir / "index.jsonl"
         self.index: list[dict[str, Any]] = []
@@ -143,7 +146,7 @@ class CachedLogitsDataset(Dataset):
     def _load_shard(self, shard_id: int) -> dict[str, torch.Tensor]:
         if shard_id not in self._shard_cache:
             shard_path = self.cache_dir / f"shard_{shard_id:04d}.pt"
-            self._shard_cache[shard_id] = torch.load(shard_path, weights_only=True)
+            self._shard_cache[shard_id] = torch.load(shard_path, weights_only=False)
         return self._shard_cache[shard_id]
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
@@ -154,18 +157,36 @@ class CachedLogitsDataset(Dataset):
         offset = entry["offset"]
         length = min(entry["length"], self.max_length)
 
-        input_ids = data["input_ids"][offset, :length]
+        # Re-tokenize with student tokenizer so input_ids are in student vocab
+        if self.student_tokenizer is not None and "text" in data:
+            text = data["text"][offset]
+            enc = self.student_tokenizer(
+                text, max_length=self.max_length, truncation=True,
+                padding="max_length", return_tensors="pt",
+            )
+            input_ids = enc["input_ids"].squeeze(0)   # [max_length]
+            attention_mask = enc["attention_mask"].squeeze(0)
+        else:
+            # Fallback: use cached input_ids (may be teacher vocab)
+            input_ids = data["input_ids"][offset, :self.max_length]
+            attention_mask = (input_ids != 0).long()
+            pad_len = self.max_length - input_ids.size(0)
+            if pad_len > 0:
+                input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=0)
+                attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_len), value=0)
+
         logit_values = data["logit_values"][offset, :length, :]    # [length, k]
         logit_indices = data["logit_indices"][offset, :length, :]  # [length, k]
 
-        pad_len = self.max_length - input_ids.size(0)
+        # Pad logits to max_length
+        pad_len = self.max_length - logit_values.size(0)
         if pad_len > 0:
-            input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=0)
             logit_values = torch.nn.functional.pad(logit_values, (0, 0, 0, pad_len), value=float("-inf"))
             logit_indices = torch.nn.functional.pad(logit_indices, (0, 0, 0, pad_len), value=0)
 
         return {
             "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "logit_values": logit_values,
             "logit_indices": logit_indices,
         }
@@ -218,8 +239,8 @@ def cache_teacher_logits(
 
     index_entries = []
     shard_idx = 0
-    shard_data: dict[str, list[torch.Tensor]] = {
-        "input_ids": [], "logit_values": [], "logit_indices": [],
+    shard_data: dict[str, list[torch.Tensor | str]] = {
+        "input_ids": [], "logit_values": [], "logit_indices": [], "text": [],
     }
 
     sample_iter = islice(ds, max_samples) if max_samples else ds
@@ -244,13 +265,14 @@ def cache_teacher_logits(
         shard_data["input_ids"].append(enc["input_ids"].cpu().squeeze(0))
         shard_data["logit_values"].append(topk_vals.cpu().squeeze(0).half())   # [S, k] fp16
         shard_data["logit_indices"].append(topk_idx.cpu().squeeze(0).int())    # [S, k] int32
+        shard_data["text"].append(text)
 
         del enc, outputs, full_logits, topk_vals, topk_idx
         torch.cuda.empty_cache()
 
         if len(shard_data["input_ids"]) >= shard_size:
             _save_sparse_shard(output_dir, shard_idx, shard_data, index_entries)
-            shard_data = {"input_ids": [], "logit_values": [], "logit_indices": []}
+            shard_data = {"input_ids": [], "logit_values": [], "logit_indices": [], "text": []}
             shard_idx += 1
             gc.collect()
 
@@ -284,7 +306,7 @@ def cache_teacher_logits(
 def _save_sparse_shard(
     output_dir: Path,
     shard_idx: int,
-    shard_data: dict[str, list[torch.Tensor]],
+    shard_data: dict[str, list[torch.Tensor | str]],
     index_entries: list[dict[str, Any]],
 ) -> None:
     """Pad and save a sparse shard."""
@@ -307,6 +329,7 @@ def _save_sparse_shard(
         "input_ids": padded_ids,
         "logit_values": padded_vals,
         "logit_indices": padded_idx,
+        "text": shard_data["text"],
     }, shard_path)
 
     for j in range(n):
@@ -420,7 +443,8 @@ def train_student(
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
 
-    dataset = CachedLogitsDataset(cache_dir, max_length=max_length)
+    dataset = CachedLogitsDataset(cache_dir, max_length=max_length,
+                                   student_tokenizer=tokenizer)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -460,6 +484,7 @@ def train_student(
     for epoch in range(epochs):
         for batch_idx, batch in enumerate(dataloader):
             input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
             logit_values = batch["logit_values"].to(device)     # [B, S, k] fp16
             logit_indices = batch["logit_indices"].to(device)   # [B, S, k] int32
 
@@ -470,7 +495,7 @@ def train_student(
             teacher_logits.scatter_(-1, logit_indices.long(), logit_values.float())
 
             # Student forward pass → logits in student vocab
-            outputs = model(input_ids=input_ids)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             student_logits = outputs.logits  # [B, S, student_vocab]
 
             # Project student logits to teacher vocab space
@@ -493,6 +518,7 @@ def train_student(
             # Hard label loss (cross-entropy on input_ids shifted by 1)
             shift_logits = student_logits[:, :-1, :].contiguous()
             shift_labels = input_ids[:, 1:].contiguous()
+            shift_mask = attention_mask[:, 1:].contiguous()
             loss_ce = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
