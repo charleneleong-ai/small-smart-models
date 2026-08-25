@@ -515,12 +515,17 @@ def train_student(
 
             # 4. KL divergence over the k positions only
             T = temperature
-            student_log_probs = F.log_softmax(gathered_student / T, dim=-1)
-            teacher_log_probs = F.log_softmax(logit_values.float() / T, dim=-1)
+            # Replace -inf with 0 before softmax (will be masked out later)
+            # This avoids log_softmax producing NaN on all-(-inf) slices
+            student_clean = gathered_student.float().masked_fill(~valid_mask, 0.0)
+            teacher_clean = logit_values.float().masked_fill(~valid_mask, 0.0)
 
-            # Mask invalid positions
-            student_log_probs = student_log_probs.masked_fill(~valid_mask, float("-inf"))
-            teacher_log_probs = teacher_log_probs.masked_fill(~valid_mask, float("-inf"))
+            student_log_probs = F.log_softmax(student_clean / T, dim=-1)
+            teacher_log_probs = F.log_softmax(teacher_clean / T, dim=-1)
+
+            # Zero out invalid positions so they don't contribute to KL
+            student_log_probs = student_log_probs.masked_fill(~valid_mask, 0.0)
+            teacher_log_probs = teacher_log_probs.masked_fill(~valid_mask, 0.0)
 
             # KL divergence with masking
             loss_kl = F.kl_div(
@@ -530,9 +535,10 @@ def train_student(
                 log_target=True,
             )  # [B, S, k]
 
-            # Average only over valid positions
+            # Zero out invalid positions and average over valid ones
+            loss_kl = loss_kl.masked_fill(~valid_mask, 0.0)
             valid_count = valid_mask.sum().clamp(min=1)
-            loss_kl = loss_kl.masked_fill(~valid_mask, 0.0).sum() / valid_count * (T ** 2)
+            loss_kl = loss_kl.sum() / valid_count * (T ** 2)
 
             # Hard label loss (cross-entropy on input_ids shifted by 1)
             shift_logits = student_logits[:, :-1, :].contiguous()
