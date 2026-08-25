@@ -317,7 +317,7 @@ def profile_hessian(
 
 @app.command("cache-teacher")
 def cache_teacher_cmd(
-    model: str = typer.Option("Qwen/Qwen3.6-35B-A3B", help="Teacher model HF repo id or local path."),
+    model: str = typer.Option("Qwen/Qwen3.8-27B", help="Teacher model HF repo id or local path."),
     out: Path = typer.Option(Path("experiments/teacher_logits"), help="Output directory for cached logits."),
     dataset: str = typer.Option("allenai/c4", help="HF dataset repo id."),
     config: str = typer.Option("en", help="Dataset config."),
@@ -357,7 +357,7 @@ def cache_teacher_cmd(
 @app.command("distill")
 def distill_cmd(
     student: str = typer.Option("Qwen/Qwen3-0.6B", help="Student model HF repo id or local path."),
-    teacher_model: str = typer.Option("Qwen/Qwen3.6-35B-A3B", help="Teacher model ID for vocab projection."),
+    teacher_model: str = typer.Option("Qwen/Qwen3.8-27B", help="Teacher model ID for vocab projection."),
     cache_dir: Path = typer.Option(Path("experiments/teacher_logits"), help="Directory with cached teacher logits."),
     out: Path = typer.Option(Path("experiments/distilled-models/student-1.5b"), help="Output directory."),
     epochs: int = typer.Option(3),
@@ -411,7 +411,7 @@ def distill_cmd(
 @app.command("distill-eval")
 def distill_eval_cmd(
     model: str = typer.Option(..., help="Path to distilled student model."),
-    teacher: str = typer.Option("Qwen/Qwen3.6-35B-A3B", help="Teacher model for comparison."),
+    teacher: str = typer.Option("Qwen/Qwen3.8-27B", help="Teacher model for comparison."),
     label: str = typer.Option(..., help="Row label for results.jsonl."),
     tasks: str = typer.Option("arc_challenge,hellaswag,winogrande,gsm8k,mmlu",
                               help="Comma-separated lm-eval tasks."),
