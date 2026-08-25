@@ -112,14 +112,16 @@ class CachedLogitsDataset(Dataset):
                 pad = torch.zeros(teacher_logits_vocab - proj_expanded.size(0), dtype=proj_expanded.dtype, device=proj_expanded.device)
                 proj_expanded = torch.cat([proj_expanded, pad])
             projected.scatter_add_(-1, proj_expanded.expand_as(logits), logits)
+            # Replace -inf with large negative for numerically stable softmax
+            projected = projected.masked_fill(projected == float("-inf"), -1e4)
             logits = projected
-
-        # Sparsify to top-k logits
-        if self.top_k < logits.size(-1):
-            topk_vals, _ = torch.topk(logits, self.top_k, dim=-1)
-            threshold = topk_vals[:, -1:].expand_as(logits)
-            mask = logits < threshold
-            logits = logits.masked_fill(mask, float("-inf"))
+        else:
+            # Sparsify to top-k logits (only when no projection)
+            if self.top_k < logits.size(-1):
+                topk_vals, _ = torch.topk(logits, self.top_k, dim=-1)
+                threshold = topk_vals[:, -1:].expand_as(logits)
+                mask = logits < threshold
+                logits = logits.masked_fill(mask, float("-inf"))
 
         # Pad to max_length so DataLoader can collate into batches
         pad_len = self.max_length - input_ids.size(0)
