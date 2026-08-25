@@ -253,6 +253,7 @@ def cache_teacher_logits(
 
     meta = {
         "model_id": model_id,
+        "teacher_vocab_size": model.config.vocab_size,
         "dataset": f"{dataset_name}:{dataset_config}",
         "split": split,
         "max_length": max_length,
@@ -375,13 +376,18 @@ def train_student(
                                                 trust_remote_code=True)
     teacher_vocab_size = teacher_tok.vocab_size
 
-    # Determine teacher vocab size from cached logits (look at actual data)
-    shard_path = cache_dir / "shard_0000.pt"
-    if shard_path.exists():
-        sample_shard = torch.load(shard_path, weights_only=True)
-        teacher_vocab_size = sample_shard["logit_indices"].max().item() + 1
-        del sample_shard
-        print(f"Teacher vocab size from cached logits: {teacher_vocab_size}")
+    # Check meta.json for teacher model vocab size
+    if meta.get("teacher_vocab_size"):
+        teacher_vocab_size = meta["teacher_vocab_size"]
+    else:
+        # Try loading teacher model config for accurate vocab_size
+        from transformers import AutoConfig
+        teacher_config = AutoConfig.from_pretrained(teacher_model_id or meta.get("model_id", student_id),
+                                                     trust_remote_code=True)
+        if hasattr(teacher_config, "vocab_size"):
+            teacher_vocab_size = teacher_config.vocab_size
+
+    print(f"Teacher vocab size: {teacher_vocab_size}")
 
     projector_path = cache_dir / "vocab_projector.pt"
     if projector_path.exists():
