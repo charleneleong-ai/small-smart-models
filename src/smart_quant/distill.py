@@ -72,29 +72,29 @@ def preproject_shards(
         data = torch.load(shard_path, weights_only=True)
         input_ids = data["input_ids"]
         logits = data["logits"]
+        n_samples, seq_len, teacher_vocab = logits.shape
 
         # Remap input_ids
         safe_ids = input_ids.clamp(0, vocab_proj.size(0) - 1)
         new_ids = vocab_proj[safe_ids]
 
-        # Project logits: only scatter non-(-inf) values for speed
-        student_vocab = student_vocab_size
-        projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
+        # Project logits efficiently: logits are already top-k=100 sparsified
+        # Use topk to get valid indices, then map via vocab_proj
+        k = min(100, teacher_vocab)
+        topk_vals, topk_idx = torch.topk(logits, k, dim=-1)  # [N, S, 100]
 
-        # Find non-(-inf) positions and scatter them
-        valid_mask = logits != float("-inf")
-        valid_indices = valid_mask.nonzero(as_tuple=False)  # [N, 3] (batch, seq, vocab)
-        if valid_indices.numel() > 0:
-            b, s, t = valid_indices.unbind(-1)
-            student_ids = vocab_proj[t.clamp(0, vocab_proj.size(0) - 1)]
-            projected[b, s, student_ids] = logits[b, s, t]
+        # Map teacher token IDs → student token IDs
+        safe_topk_idx = topk_idx.clamp(0, vocab_proj.size(0) - 1)
+        student_ids = vocab_proj[safe_topk_idx]  # [N, S, 100]
 
-        # Replace remaining -inf with large negative for numerical stability
+        # Scatter into student vocab
+        projected = torch.full((n_samples, seq_len, student_vocab_size), float("-inf"), dtype=logits.dtype)
+        projected.scatter_add_(-1, student_ids, topk_vals)
         projected = projected.masked_fill(projected == float("-inf"), -1e4)
 
         # Save projected shard
         torch.save({"input_ids": new_ids, "logits": projected}, shard_path)
-        print(f"done ({valid_indices.shape[0]} valid logits, logits: {logits.shape} → {projected.shape})")
+        print(f"done ({k} top-k, logits: {logits.shape} → {projected.shape})")
         del data, input_ids, logits, projected
         gc.collect()
 
