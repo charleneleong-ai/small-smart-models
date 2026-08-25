@@ -518,6 +518,17 @@ def train_student(
             student_clean = gathered_student.float().masked_fill(~valid_mask, 0.0)
             teacher_clean = logit_values.float().masked_fill(~valid_mask, 0.0)
 
+            # Debug: check for NaN
+            if global_step == 0 and batch_idx == 0:
+                n_valid = valid_mask.sum().item()
+                s_nan = torch.isnan(student_clean).sum().item()
+                t_nan = torch.isnan(teacher_clean).sum().item()
+                s_inf = torch.isinf(student_clean).sum().item()
+                t_inf = torch.isinf(teacher_clean).sum().item()
+                print(f"  DEBUG: valid={n_valid}/{valid_mask.numel()}, "
+                      f"student NaN={s_nan} inf={s_inf} range=[{student_clean[valid_mask].min():.2f}, {student_clean[valid_mask].max():.2f}], "
+                      f"teacher NaN={t_nan} inf={t_inf} range=[{teacher_clean[valid_mask].min():.2f}, {teacher_clean[valid_mask].max():.2f}]")
+
             # Softmax for both, then MSE (avoids log-space NaN)
             student_probs = F.softmax(student_clean / T, dim=-1)
             teacher_probs = F.softmax(teacher_clean / T, dim=-1)
@@ -540,6 +551,11 @@ def train_student(
 
             # Combined loss
             loss = alpha * loss_kl + (1 - alpha) * loss_ce
+
+            # Debug: check final loss
+            if global_step == 0 and batch_idx == 0:
+                print(f"  DEBUG loss: kl={loss_kl.item():.6f} ce={loss_ce.item():.6f} combined={loss.item():.6f} "
+                      f"kl_nan={torch.isnan(loss_kl)} ce_nan={torch.isnan(loss_ce)}")
 
             # Backward
             loss = loss / gradient_accumulation_steps
