@@ -77,20 +77,24 @@ def preproject_shards(
         safe_ids = input_ids.clamp(0, vocab_proj.size(0) - 1)
         new_ids = vocab_proj[safe_ids]
 
-        # Project logits: scatter teacher logits into student vocab
-        teacher_logits_vocab = logits.size(-1)
-        proj = vocab_proj
-        projected = torch.full(logits.shape[:-1] + (student_vocab_size,), float("-inf"), dtype=logits.dtype)
-        proj_expanded = proj
-        if proj_expanded.size(0) < teacher_logits_vocab:
-            pad = torch.zeros(teacher_logits_vocab - proj_expanded.size(0), dtype=proj_expanded.dtype)
-            proj_expanded = torch.cat([proj_expanded, pad])
-        projected.scatter_add_(-1, proj_expanded.expand_as(logits), logits)
+        # Project logits: only scatter non-(-inf) values for speed
+        student_vocab = student_vocab_size
+        projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
+
+        # Find non-(-inf) positions and scatter them
+        valid_mask = logits != float("-inf")
+        valid_indices = valid_mask.nonzero(as_tuple=False)  # [N, 3] (batch, seq, vocab)
+        if valid_indices.numel() > 0:
+            b, s, t = valid_indices.unbind(-1)
+            student_ids = vocab_proj[t.clamp(0, vocab_proj.size(0) - 1)]
+            projected[b, s, student_ids] = logits[b, s, t]
+
+        # Replace remaining -inf with large negative for numerical stability
         projected = projected.masked_fill(projected == float("-inf"), -1e4)
 
         # Save projected shard
         torch.save({"input_ids": new_ids, "logits": projected}, shard_path)
-        print(f"done (logits: {logits.shape} → {projected.shape})")
+        print(f"done ({valid_indices.shape[0]} valid logits, logits: {logits.shape} → {projected.shape})")
         del data, input_ids, logits, projected
         gc.collect()
 
