@@ -506,13 +506,12 @@ def train_student(
             mapped_indices = teacher_to_student.to(device)[safe_idx]  # [B, S, k] in student vocab
 
             # 2. Extract student logits at those positions
-            # gathered_student[i,j,l] = student_logits[i, j, mapped_indices[i,j,l]]
             gathered_student = torch.gather(
                 student_logits, -1, mapped_indices.long()
             )  # [B, S, k]
 
-            # 3. Build a mask for valid mappings (mapping > 0 means it was mapped)
-            valid_mask = (safe_idx > 0) & (safe_idx < teacher_to_student.size(0))
+            # 3. Mask: exclude padded positions (logit_values == -inf)
+            valid_mask = logit_values.float() > float("-inf")
 
             # 4. KL divergence over the k positions only
             T = temperature
