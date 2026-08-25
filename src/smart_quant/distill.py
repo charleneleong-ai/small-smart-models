@@ -513,26 +513,17 @@ def train_student(
             # 3. Mask: exclude padded positions (logit_values == -inf)
             valid_mask = logit_values.float() > float("-inf")
 
-            # 4. KL divergence over the k positions only
+            # 4. Distillation loss: MSE on logits (numerically stable, no softmax)
             T = temperature
-            # Replace -inf with 0 before softmax (will be masked out after KL)
             student_clean = gathered_student.float().masked_fill(~valid_mask, 0.0)
             teacher_clean = logit_values.float().masked_fill(~valid_mask, 0.0)
 
-            # Compute log-softmax (finite everywhere since -inf replaced with 0)
-            student_log_probs = F.log_softmax(student_clean / T, dim=-1)
-            teacher_log_probs = F.log_softmax(teacher_clean / T, dim=-1)
+            # Softmax for both, then MSE (avoids log-space NaN)
+            student_probs = F.softmax(student_clean / T, dim=-1)
+            teacher_probs = F.softmax(teacher_clean / T, dim=-1)
 
-            # KL divergence first, THEN mask (not before — masking log-probs to 0
-            # = prob 1.0 corrupts the distribution)
-            loss_kl = F.kl_div(
-                student_log_probs,
-                teacher_log_probs,
-                reduction="none",
-                log_target=True,
-            )  # [B, S, k]
-
-            # Zero out invalid positions and average over valid ones
+            # MSE loss on probability distributions
+            loss_kl = F.mse_loss(student_probs, teacher_probs, reduction="none")
             loss_kl = loss_kl.masked_fill(~valid_mask, 0.0)
             valid_count = valid_mask.sum().clamp(min=1)
             loss_kl = loss_kl.sum() / valid_count * (T ** 2)
