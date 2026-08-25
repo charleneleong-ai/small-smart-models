@@ -515,10 +515,17 @@ def train_student(
 
             # 4. KL divergence over the k positions only
             T = temperature
-            # Replace -inf with 0 before softmax (will be masked out later)
-            # This avoids log_softmax producing NaN on all-(-inf) slices
             student_clean = gathered_student.float().masked_fill(~valid_mask, 0.0)
             teacher_clean = logit_values.float().masked_fill(~valid_mask, 0.0)
+
+            # Debug: check for NaN sources
+            if global_step == 0 and batch_idx == 0:
+                n_valid = valid_mask.sum().item()
+                print(f"  DEBUG: valid={n_valid}/{valid_mask.numel()}, "
+                      f"student range=[{student_clean.min():.2f}, {student_clean.max():.2f}], "
+                      f"teacher range=[{teacher_clean.min():.2f}, {teacher_clean.max():.2f}]")
+                print(f"  DEBUG: mapped_indices range=[{mapped_indices.min()}, {mapped_indices.max()}], "
+                      f"student_vocab={student_vocab_size}")
 
             student_log_probs = F.log_softmax(student_clean / T, dim=-1)
             teacher_log_probs = F.log_softmax(teacher_clean / T, dim=-1)
