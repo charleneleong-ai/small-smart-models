@@ -498,22 +498,40 @@ def train_student(
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             student_logits = outputs.logits  # [B, S, student_vocab]
 
-            # Project student logits to teacher vocab space
-            projected_logits = vocab_projector(student_logits)  # [B, S, teacher_vocab]
+            # Distillation loss: KL only over teacher's top-k positions
+            # 1. Map teacher token indices → student token indices
+            safe_idx = logit_indices.clamp(0, vocab_projector.mapping.size(0) - 1)
+            mapped_indices = vocab_projector.mapping[safe_idx]  # [B, S, k]
 
-            # Distillation loss (KL divergence with temperature)
-            # Both distributions are now in teacher vocab space
+            # 2. Extract student logits at those positions
+            # gathered_student[i,j,l] = student_logits[i, j, mapped_indices[i,j,l]]
+            gathered_student = torch.gather(
+                student_logits, -1, mapped_indices.long()
+            )  # [B, S, k]
+
+            # 3. Build a mask for valid mappings (mapping > 0 means it was mapped)
+            valid_mask = (safe_idx > 0) & (safe_idx < vocab_projector.mapping.size(0))
+
+            # 4. KL divergence over the k positions only
             T = temperature
+            student_log_probs = F.log_softmax(gathered_student / T, dim=-1)
+            teacher_log_probs = F.log_softmax(logit_values.float() / T, dim=-1)
 
-            student_log_probs = F.log_softmax(projected_logits / T, dim=-1)
-            teacher_log_probs = torch.log(F.softmax(teacher_logits / T, dim=-1) + 1e-8)
+            # Mask invalid positions
+            student_log_probs = student_log_probs.masked_fill(~valid_mask, float("-inf"))
+            teacher_log_probs = teacher_log_probs.masked_fill(~valid_mask, float("-inf"))
 
+            # KL divergence with masking
             loss_kl = F.kl_div(
                 student_log_probs,
                 teacher_log_probs,
-                reduction="batchmean",
+                reduction="none",
                 log_target=True,
-            ) * (T ** 2)
+            )  # [B, S, k]
+
+            # Average only over valid positions
+            valid_count = valid_mask.sum().clamp(min=1)
+            loss_kl = loss_kl.masked_fill(~valid_mask, 0.0).sum() / valid_count * (T ** 2)
 
             # Hard label loss (cross-entropy on input_ids shifted by 1)
             shift_logits = student_logits[:, :-1, :].contiguous()
