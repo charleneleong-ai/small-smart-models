@@ -428,17 +428,19 @@ def train_student(
     if projector_path.exists():
         print(f"Loading cached vocab projector: {projector_path}")
         saved = torch.load(projector_path, weights_only=True)
-        vocab_projector = VocabProjector(saved["mapping"], saved["teacher_vocab"])
+        teacher_to_student = saved["teacher_to_student"]
     else:
-        print(f"Building vocab projector: student {student_vocab_size} → teacher {teacher_vocab_size}")
-        reverse_mapping = build_reverse_vocab_projection(teacher_model_id or meta.get("model_id", student_id),
-                                                         student_id,
-                                                         student_model_vocab_size=student_vocab_size)
-        vocab_projector = VocabProjector(reverse_mapping, teacher_vocab_size)
-        torch.save({"mapping": reverse_mapping, "teacher_vocab": teacher_vocab_size}, projector_path)
-        print(f"Sparse projector initialized ({(reverse_mapping > 0).sum()}/{student_vocab_size} valid mappings)")
-
-    vocab_projector = vocab_projector.to(device)
+        print(f"Building vocab projection: teacher {teacher_vocab_size} → student {student_vocab_size}")
+        teacher_to_student = build_vocab_projection(teacher_model_id or meta.get("model_id", student_id),
+                                                     student_id,
+                                                     device="cpu")
+        # Pad to teacher_vocab_size (model.config.vocab_size may be > tokenizer.vocab_size)
+        if teacher_to_student.size(0) < teacher_vocab_size:
+            pad = torch.zeros(teacher_vocab_size - teacher_to_student.size(0), dtype=torch.long)
+            teacher_to_student = torch.cat([teacher_to_student, pad])
+        torch.save({"teacher_to_student": teacher_to_student, "teacher_vocab": teacher_vocab_size,
+                     "student_vocab": student_vocab_size}, projector_path)
+        print(f"Projection ready: {teacher_to_student.size(0)} teacher → student tokens")
 
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
@@ -500,8 +502,8 @@ def train_student(
 
             # Distillation loss: KL only over teacher's top-k positions
             # 1. Map teacher token indices → student token indices
-            safe_idx = logit_indices.clamp(0, vocab_projector.mapping.size(0) - 1)
-            mapped_indices = vocab_projector.mapping[safe_idx]  # [B, S, k]
+            safe_idx = logit_indices.clamp(0, teacher_to_student.size(0) - 1)
+            mapped_indices = teacher_to_student.to(device)[safe_idx]  # [B, S, k] in student vocab
 
             # 2. Extract student logits at those positions
             # gathered_student[i,j,l] = student_logits[i, j, mapped_indices[i,j,l]]
@@ -510,7 +512,7 @@ def train_student(
             )  # [B, S, k]
 
             # 3. Build a mask for valid mappings (mapping > 0 means it was mapped)
-            valid_mask = (safe_idx > 0) & (safe_idx < vocab_projector.mapping.size(0))
+            valid_mask = (safe_idx > 0) & (safe_idx < teacher_to_student.size(0))
 
             # 4. KL divergence over the k positions only
             T = temperature
