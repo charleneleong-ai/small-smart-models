@@ -19,21 +19,33 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 
-class VocabProjector(nn.Module):
-    """Projects student logits to teacher vocab space via a learned linear layer."""
+class VocabProjector(torch.nn.Module):
+    """Projects student logits to teacher vocab space via scatter lookup.
 
-    def __init__(self, student_vocab: int, teacher_vocab: int) -> None:
+    Instead of a dense [student_vocab × teacher_vocab] matrix (143GB for this pair),
+    stores a sparse index mapping [student_vocab] → teacher_token_id and uses scatter_
+    to route logits.
+    """
+
+    def __init__(self, student_to_teacher: torch.Tensor, teacher_vocab: int) -> None:
         super().__init__()
-        self.linear = nn.Linear(student_vocab, teacher_vocab, bias=False)
+        self.register_buffer("mapping", student_to_teacher.long())  # [student_vocab]
+        self.teacher_vocab = teacher_vocab
 
     def forward(self, student_logits: torch.Tensor) -> torch.Tensor:
         """Project [B, S, student_vocab] → [B, S, teacher_vocab]."""
-        return self.linear(student_logits.float())
+        B, S, _ = student_logits.shape
+        # Initialize with -inf (unmapped positions)
+        teacher_logits = torch.full((B, S, self.teacher_vocab), float("-inf"),
+                                    dtype=student_logits.dtype, device=student_logits.device)
+        # Expand mapping to batch: [B, S, student_vocab]
+        expanded_map = self.mapping.unsqueeze(0).unsqueeze(0).expand(B, S, -1)
+        teacher_logits.scatter_(-1, expanded_map, student_logits)
+        return teacher_logits
 
 
 def build_reverse_vocab_projection(
@@ -392,25 +404,16 @@ def train_student(
     projector_path = cache_dir / "vocab_projector.pt"
     if projector_path.exists():
         print(f"Loading cached vocab projector: {projector_path}")
-        vocab_projector = VocabProjector(student_vocab_size, teacher_vocab_size)
-        vocab_projector.load_state_dict(torch.load(projector_path, weights_only=True))
+        saved = torch.load(projector_path, weights_only=True)
+        vocab_projector = VocabProjector(saved["mapping"], saved["teacher_vocab"])
     else:
         print(f"Building vocab projector: student {student_vocab_size} → teacher {teacher_vocab_size}")
         reverse_mapping = build_reverse_vocab_projection(teacher_model_id or meta.get("model_id", student_id),
                                                          student_id,
                                                          student_model_vocab_size=student_vocab_size)
-        # Initialize projection as sparse one-hot: [student_vocab, teacher_vocab]
-        proj = torch.zeros(student_vocab_size, teacher_vocab_size)
-        valid = reverse_mapping > 0
-        proj[valid, reverse_mapping[valid]] = 1.0
-        # Also map token 0 to token 0
-        proj[0, 0] = 1.0
-
-        vocab_projector = VocabProjector(student_vocab_size, teacher_vocab_size)
-        with torch.no_grad():
-            vocab_projector.linear.weight.copy_(proj)
-        torch.save(vocab_projector.state_dict(), projector_path)
-        print(f"Sparse projector initialized ({valid.sum()}/{student_vocab_size} valid mappings)")
+        vocab_projector = VocabProjector(reverse_mapping, teacher_vocab_size)
+        torch.save({"mapping": reverse_mapping, "teacher_vocab": teacher_vocab_size}, projector_path)
+        print(f"Sparse projector initialized ({(reverse_mapping > 0).sum()}/{student_vocab_size} valid mappings)")
 
     vocab_projector = vocab_projector.to(device)
 
@@ -426,9 +429,9 @@ def train_student(
         pin_memory=True,
     )
 
-    # Combine student model + projector parameters
+    # Combine student model parameters (projector has no learnable params)
     optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(vocab_projector.parameters()),
+        model.parameters(),
         lr=learning_rate,
         weight_decay=weight_decay,
         betas=(0.9, 0.999),
@@ -451,7 +454,6 @@ def train_student(
                            "lr": learning_rate, "epochs": epochs})
 
     model.train()
-    vocab_projector.train()
     global_step = 0
     running_loss = 0.0
 
@@ -505,8 +507,7 @@ def train_student(
             loss.backward()
 
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(vocab_projector.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
