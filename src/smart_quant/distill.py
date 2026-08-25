@@ -438,7 +438,8 @@ def train_student(
             B, S, k = logit_values.shape
             teacher_logits = torch.full((B, S, student_vocab_size), float("-inf"),
                                         dtype=torch.float32, device=device)
-            teacher_logits.scatter_add_(-1, logit_indices.long(), logit_values.float())
+            # Use scatter_ (last-write-wins) not scatter_add_ (sums duplicate mappings)
+            teacher_logits.scatter_(-1, logit_indices.long(), logit_values.float())
 
             # Forward pass
             outputs = model(input_ids=input_ids)
