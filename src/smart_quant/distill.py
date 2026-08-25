@@ -52,6 +52,59 @@ def build_vocab_projection(
     return mapping
 
 
+def preproject_shards(
+    cache_dir: Path,
+    vocab_proj: torch.Tensor,
+    student_vocab_size: int,
+) -> None:
+    """Pre-project all cached shards from teacher vocab to student vocab.
+
+    This eliminates the per-sample projection overhead during training.
+    Overwrites shards in-place with projected versions and updates meta.json.
+    """
+    import gc
+
+    shard_files = sorted(cache_dir.glob("shard_*.pt"))
+    print(f"Pre-projecting {len(shard_files)} shards: teacher → student vocab ({student_vocab_size})")
+
+    for shard_path in shard_files:
+        print(f"  Projecting {shard_path.name}...", end=" ", flush=True)
+        data = torch.load(shard_path, weights_only=True)
+        input_ids = data["input_ids"]
+        logits = data["logits"]
+
+        # Remap input_ids
+        safe_ids = input_ids.clamp(0, vocab_proj.size(0) - 1)
+        new_ids = vocab_proj[safe_ids]
+
+        # Project logits: scatter teacher logits into student vocab
+        teacher_logits_vocab = logits.size(-1)
+        proj = vocab_proj
+        projected = torch.full(logits.shape[:-1] + (student_vocab_size,), float("-inf"), dtype=logits.dtype)
+        proj_expanded = proj
+        if proj_expanded.size(0) < teacher_logits_vocab:
+            pad = torch.zeros(teacher_logits_vocab - proj_expanded.size(0), dtype=proj_expanded.dtype)
+            proj_expanded = torch.cat([proj_expanded, pad])
+        projected.scatter_add_(-1, proj_expanded.expand_as(logits), logits)
+        projected = projected.masked_fill(projected == float("-inf"), -1e4)
+
+        # Save projected shard
+        torch.save({"input_ids": new_ids, "logits": projected}, shard_path)
+        print(f"done (logits: {logits.shape} → {projected.shape})")
+        del data, input_ids, logits, projected
+        gc.collect()
+
+    # Update meta.json
+    meta_path = cache_dir / "meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        meta["student_vocab_size"] = student_vocab_size
+        meta["projected"] = True
+        meta_path.write_text(json.dumps(meta, indent=2))
+
+    print("Pre-projection complete")
+
+
 class CachedLogitsDataset(Dataset):
     """Dataset of cached teacher logits + input IDs for offline distillation."""
 
@@ -60,13 +113,11 @@ class CachedLogitsDataset(Dataset):
         cache_dir: Path,
         max_length: int = 2048,
         top_k: int = 100,
-        vocab_proj: torch.Tensor | None = None,
         student_vocab_size: int | None = None,
     ):
         self.cache_dir = Path(cache_dir)
         self.max_length = max_length
         self.top_k = top_k
-        self.vocab_proj = vocab_proj  # [teacher_vocab] long mapping or None
         self.student_vocab_size = student_vocab_size
 
         # Load index file
@@ -94,34 +145,12 @@ class CachedLogitsDataset(Dataset):
         input_ids = data["input_ids"][offset, :length]
         logits = data["logits"][offset, :length, :]
 
-        # Project teacher logits AND input_ids to student vocab if needed
-        if self.vocab_proj is not None:
-            # vocab_proj: [teacher_vocab] long tensor mapping teacher→student token IDs
-            proj = self.vocab_proj
-
-            # Remap input_ids: teacher token ID → student token ID
-            safe_ids = input_ids.clamp(0, proj.size(0) - 1)
-            input_ids = proj[safe_ids]
-
-            # Remap logits: scatter teacher logits into student vocab
-            teacher_logits_vocab = logits.size(-1)
-            student_vocab = self.student_vocab_size or (int(proj.max()) + 1)
-            projected = torch.full(logits.shape[:-1] + (student_vocab,), float("-inf"), dtype=logits.dtype)
-            proj_expanded = proj.to(logits.device)
-            if proj_expanded.size(0) < teacher_logits_vocab:
-                pad = torch.zeros(teacher_logits_vocab - proj_expanded.size(0), dtype=proj_expanded.dtype, device=proj_expanded.device)
-                proj_expanded = torch.cat([proj_expanded, pad])
-            projected.scatter_add_(-1, proj_expanded.expand_as(logits), logits)
-            # Replace -inf with large negative for numerically stable softmax
-            projected = projected.masked_fill(projected == float("-inf"), -1e4)
-            logits = projected
-        else:
-            # Sparsify to top-k logits (only when no projection)
-            if self.top_k < logits.size(-1):
-                topk_vals, _ = torch.topk(logits, self.top_k, dim=-1)
-                threshold = topk_vals[:, -1:].expand_as(logits)
-                mask = logits < threshold
-                logits = logits.masked_fill(mask, float("-inf"))
+        # Sparsify to top-k logits (skip if already projected with -1e4 floor)
+        if self.top_k < logits.size(-1) and self.student_vocab_size is None:
+            topk_vals, _ = torch.topk(logits, self.top_k, dim=-1)
+            threshold = topk_vals[:, -1:].expand_as(logits)
+            mask = logits < threshold
+            logits = logits.masked_fill(mask, float("-inf"))
 
         # Pad to max_length so DataLoader can collate into batches
         pad_len = self.max_length - input_ids.size(0)
@@ -353,28 +382,25 @@ def train_student(
     tokenizer = AutoTokenizer.from_pretrained(student_id, trust_remote_code=True)
     model = load_causal_lm(student_id, dtype=torch.float16, device_map=device,
                            trust_remote_code=True)
+    student_vocab_size = model.config.vocab_size
 
     # Build vocab projection if teacher and student have different vocabs
     vocab_proj = None
-    saved_proj_path = cache_dir / "vocab_proj.pt"
-    if saved_proj_path.exists():
-        vocab_proj = torch.load(saved_proj_path, weights_only=True)
-        print(f"Loaded saved vocab projection from {saved_proj_path}")
+    meta_path = cache_dir / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    if meta.get("projected"):
+        print(f"Shards already pre-projected to student vocab {meta.get('student_vocab_size')}")
     elif teacher_model_id:
         teacher_tok = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
         if teacher_tok.vocab_size != tokenizer.vocab_size:
-            print(f"Building vocab projection: teacher {teacher_tok.vocab_size} → student {tokenizer.vocab_size}")
+            print(f"Building vocab projection: teacher {teacher_tok.vocab_size} → student {student_vocab_size}")
             vocab_proj = build_vocab_projection(teacher_model_id, student_id, device="cpu")
-            torch.save(vocab_proj, saved_proj_path)
-            print(f"Saved vocab projection to {saved_proj_path}")
-
-    # Enable gradient checkpointing for memory efficiency
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+            torch.save(vocab_proj, cache_dir / "vocab_proj.pt")
+            # Pre-project all shards
+            preproject_shards(cache_dir, vocab_proj, student_vocab_size)
 
     # Load dataset
-    student_vocab_size = model.config.vocab_size
-    dataset = CachedLogitsDataset(cache_dir, max_length=max_length, vocab_proj=vocab_proj,
+    dataset = CachedLogitsDataset(cache_dir, max_length=max_length,
                                   student_vocab_size=student_vocab_size)
     dataloader = DataLoader(
         dataset,
