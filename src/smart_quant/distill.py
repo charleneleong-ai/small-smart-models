@@ -39,23 +39,28 @@ class VocabProjector(nn.Module):
 def build_reverse_vocab_projection(
     teacher_model_id: str,
     student_model_id: str,
+    student_model_vocab_size: int | None = None,
 ) -> torch.Tensor:
-    """Build a student→teacher vocab mapping as a 2-D projection matrix.
+    """Build a student→teacher vocab mapping.
 
-    For each student token, find the corresponding teacher token ID.
+    Args:
+        teacher_model_id: Teacher model ID
+        student_model_id: Student model ID
+        student_model_vocab_size: Model's actual vocab size (may exceed tokenizer.vocab_size)
+
     Returns:
-        Long tensor of shape [student_vocab] where entry[i] = teacher token ID.
+        Long tensor of shape [student_model_vocab_size] where entry[i] = teacher token ID.
     """
     from transformers import AutoTokenizer
 
     teacher_tok = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
     student_tok = AutoTokenizer.from_pretrained(student_model_id, trust_remote_code=True)
 
-    student_vocab = student_tok.vocab_size
-    teacher_vocab = teacher_tok.vocab_size
+    # Use model's vocab size (may be larger than tokenizer.vocab_size)
+    student_vocab = student_model_vocab_size or student_tok.vocab_size
     mapping = torch.zeros(student_vocab, dtype=torch.long)
     mapped = 0
-    for s_id in range(student_vocab):
+    for s_id in range(min(student_tok.vocab_size, student_vocab)):
         token_str = student_tok.decode([s_id])
         t_ids = teacher_tok.encode(token_str, add_special_tokens=False)
         if t_ids:
@@ -386,7 +391,8 @@ def train_student(
     else:
         print(f"Building vocab projector: student {student_vocab_size} → teacher {teacher_vocab_size}")
         reverse_mapping = build_reverse_vocab_projection(teacher_model_id or meta.get("model_id", student_id),
-                                                         student_id)
+                                                         student_id,
+                                                         student_model_vocab_size=student_vocab_size)
         # Initialize projection as sparse one-hot: [student_vocab, teacher_vocab]
         proj = torch.zeros(student_vocab_size, teacher_vocab_size)
         valid = reverse_mapping > 0
