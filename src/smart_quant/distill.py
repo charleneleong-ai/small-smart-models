@@ -1,8 +1,11 @@
 """Knowledge distillation: cache teacher logits, train student against cached targets.
 
-Phase 1: Cache teacher logits (offline KD)
-Phase 2: Train student against cached logits (with vocab projection if teacher != student vocab)
+Phase 1: Cache teacher logits (offline KD) — sparse top-k format
+Phase 2: Train student against cached logits (with optional vocab projection)
 Phase 3: Evaluate distilled student
+
+Sparse format: each shard stores top-k (values, indices) per position instead of
+the full vocab distribution. Reduces shard size from ~15GB to ~10MB (1500× smaller).
 """
 from __future__ import annotations
 
@@ -23,11 +26,6 @@ def build_vocab_projection(
 ) -> torch.Tensor:
     """Build a teacher→student vocab mapping as a 1-D lookup tensor.
 
-    For each teacher token, decode it to text and re-encode with the student
-    tokenizer. The resulting student token ID becomes the mapping target.
-    Teacher tokens that map to multiple student tokens are assigned to the
-    first sub-token (approximate but preserves most probability mass).
-
     Returns:
         Long tensor of shape [teacher_vocab] where entry[i] = student token ID.
     """
@@ -37,8 +35,6 @@ def build_vocab_projection(
     student_tok = AutoTokenizer.from_pretrained(student_model_id, trust_remote_code=True)
 
     teacher_vocab = teacher_tok.vocab_size
-    student_vocab = student_tok.vocab_size
-
     mapping = torch.zeros(teacher_vocab, dtype=torch.long)
     mapped = 0
     for t_id in range(teacher_vocab):
@@ -56,46 +52,39 @@ def preproject_shards(
     cache_dir: Path,
     vocab_proj: torch.Tensor,
     student_vocab_size: int,
+    top_k: int = 100,
 ) -> None:
-    """Pre-project all cached shards from teacher vocab to student vocab.
+    """Pre-project all cached sparse shards from teacher vocab to student vocab.
 
-    This eliminates the per-sample projection overhead during training.
-    Overwrites shards in-place with projected versions and updates meta.json.
+    Maps teacher token indices → student token indices in the sparse format.
+    Overwrites shards in-place and updates meta.json.
     """
-    import gc
-
     shard_files = sorted(cache_dir.glob("shard_*.pt"))
-    print(f"Pre-projecting {len(shard_files)} shards: teacher → student vocab ({student_vocab_size})")
+    print(f"Pre-projecting {len(shard_files)} sparse shards: teacher → student vocab ({student_vocab_size})")
 
     for shard_path in shard_files:
         print(f"  Projecting {shard_path.name}...", end=" ", flush=True)
         data = torch.load(shard_path, weights_only=True)
         input_ids = data["input_ids"]
-        logits = data["logits"]
-        n_samples, seq_len, teacher_vocab = logits.shape
+        logit_values = data["logit_values"]    # [N, S, k] fp16
+        logit_indices = data["logit_indices"]  # [N, S, k] int32
 
         # Remap input_ids
         safe_ids = input_ids.clamp(0, vocab_proj.size(0) - 1)
         new_ids = vocab_proj[safe_ids]
 
-        # Project logits efficiently: logits are already top-k=100 sparsified
-        # Use topk to get valid indices, then map via vocab_proj
-        k = min(100, teacher_vocab)
-        topk_vals, topk_idx = torch.topk(logits, k, dim=-1)  # [N, S, 100]
-
-        # Map teacher token IDs → student token IDs
-        safe_topk_idx = topk_idx.clamp(0, vocab_proj.size(0) - 1)
-        student_ids = vocab_proj[safe_topk_idx]  # [N, S, 100]
-
-        # Scatter into student vocab
-        projected = torch.full((n_samples, seq_len, student_vocab_size), float("-inf"), dtype=logits.dtype)
-        projected.scatter_add_(-1, student_ids, topk_vals)
-        projected = projected.masked_fill(projected == float("-inf"), -1e4)
+        # Remap logit indices: teacher vocab → student vocab
+        safe_idx = logit_indices.clamp(0, vocab_proj.size(0) - 1)
+        student_indices = vocab_proj[safe_idx].to(torch.int32)
 
         # Save projected shard
-        torch.save({"input_ids": new_ids, "logits": projected}, shard_path)
-        print(f"done ({k} top-k, logits: {logits.shape} → {projected.shape})")
-        del data, input_ids, logits, projected
+        torch.save({
+            "input_ids": new_ids,
+            "logit_values": logit_values,
+            "logit_indices": student_indices,
+        }, shard_path)
+        print(f"done (logits: [{logit_values.shape[0]}, {logit_values.shape[1]}, {top_k}] → student vocab {student_vocab_size})")
+        del data, input_ids, logit_values, logit_indices
         gc.collect()
 
     # Update meta.json
@@ -110,7 +99,13 @@ def preproject_shards(
 
 
 class CachedLogitsDataset(Dataset):
-    """Dataset of cached teacher logits + input IDs for offline distillation."""
+    """Dataset of cached teacher logits (sparse top-k format) for offline distillation.
+
+    Each shard stores:
+        input_ids:  [N, S] long
+        logit_values:  [N, S, k] fp16  (top-k values)
+        logit_indices: [N, S, k] int32 (top-k positions in vocab)
+    """
 
     def __init__(
         self,
@@ -131,40 +126,41 @@ class CachedLogitsDataset(Dataset):
             for line in f:
                 self.index.append(json.loads(line))
 
+        # Cache shard data to avoid re-loading from disk for every sample
+        self._shard_cache: dict[int, dict[str, torch.Tensor]] = {}
+
     def __len__(self) -> int:
         return len(self.index)
 
+    def _load_shard(self, shard_id: int) -> dict[str, torch.Tensor]:
+        if shard_id not in self._shard_cache:
+            shard_path = self.cache_dir / f"shard_{shard_id:04d}.pt"
+            self._shard_cache[shard_id] = torch.load(shard_path, weights_only=True)
+        return self._shard_cache[shard_id]
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         entry = self.index[idx]
-        shard = entry["shard"]
-
-        # Load cached shard
-        shard_path = self.cache_dir / f"shard_{shard:04d}.pt"
-        data = torch.load(shard_path, weights_only=True)
+        shard_id = entry["shard"]
+        data = self._load_shard(shard_id)
 
         offset = entry["offset"]
         length = min(entry["length"], self.max_length)
 
-        # Index into batch dimension to get single sample
         input_ids = data["input_ids"][offset, :length]
-        logits = data["logits"][offset, :length, :]
+        logit_values = data["logit_values"][offset, :length, :]    # [length, k]
+        logit_indices = data["logit_indices"][offset, :length, :]  # [length, k]
 
-        # Sparsify to top-k logits (skip if already projected with -1e4 floor)
-        if self.top_k < logits.size(-1) and self.student_vocab_size is None:
-            topk_vals, _ = torch.topk(logits, self.top_k, dim=-1)
-            threshold = topk_vals[:, -1:].expand_as(logits)
-            mask = logits < threshold
-            logits = logits.masked_fill(mask, float("-inf"))
-
-        # Pad to max_length so DataLoader can collate into batches
+        # Pad to max_length
         pad_len = self.max_length - input_ids.size(0)
         if pad_len > 0:
             input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=0)
-            logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_len), value=float("-inf"))
+            logit_values = torch.nn.functional.pad(logit_values, (0, 0, 0, pad_len), value=float("-inf"))
+            logit_indices = torch.nn.functional.pad(logit_indices, (0, 0, 0, pad_len), value=0)
 
         return {
             "input_ids": input_ids,
-            "logits": logits,
+            "logit_values": logit_values,
+            "logit_indices": logit_indices,
         }
 
 
@@ -175,12 +171,15 @@ def cache_teacher_logits(
     dataset_config: str = "en",
     split: str = "train",
     max_length: int = 2048,
-    shard_size: int = 1000,
+    shard_size: int = 100,
     top_k: int = 100,
     max_samples: int | None = None,
     device: str = "cuda",
 ) -> Path:
-    """Cache teacher model's top-K logits for offline distillation.
+    """Cache teacher model's top-K logits in sparse format.
+
+    Each shard stores only the top-k (value, index) pairs per token position
+    instead of the full vocab distribution. Reduces storage ~1500×.
 
     Args:
         model_id: HuggingFace model ID or local path
@@ -207,20 +206,18 @@ def cache_teacher_logits(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load teacher using the fallback-aware loader
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     model = load_causal_lm(model_id, dtype=torch.float16, device_map=device,
                            trust_remote_code=True, low_cpu_mem_usage=True).eval()
 
-    # Load dataset (streaming to avoid full download)
     ds = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
 
-    # Cache logits
     index_entries = []
     shard_idx = 0
-    shard_data: dict[str, list[torch.Tensor]] = {"input_ids": [], "logits": []}
+    shard_data: dict[str, list[torch.Tensor]] = {
+        "input_ids": [], "logit_values": [], "logit_indices": [],
+    }
 
-    # Use islice for streaming mode to limit samples
     sample_iter = islice(ds, max_samples) if max_samples else ds
 
     for i, sample in enumerate(sample_iter):
@@ -229,54 +226,28 @@ def cache_teacher_logits(
             continue
 
         enc = tokenizer(
-            text,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
+            text, max_length=max_length, truncation=True, return_tensors="pt",
         ).to(device)
 
         with torch.no_grad():
             outputs = model(**enc)
-            logits = outputs.logits.half()  # fp16 to save CPU RAM
+            full_logits = outputs.logits.float()  # [1, seq_len, vocab]
 
-        # Sparsify to top-k
-        if top_k < logits.size(-1):
-            topk_vals, _ = torch.topk(logits, top_k, dim=-1)
-            threshold = topk_vals[:, :, -1:].expand_as(logits)
-            mask = logits < threshold
-            logits = logits.masked_fill(mask, float("-inf"))
+        # Extract top-k sparse representation
+        k = min(top_k, full_logits.size(-1))
+        topk_vals, topk_idx = torch.topk(full_logits, k, dim=-1)  # [1, S, k]
 
-        shard_data["input_ids"].append(enc["input_ids"].cpu().squeeze(0))  # [seq_len]
-        shard_data["logits"].append(logits.cpu().squeeze(0))              # [seq_len, vocab]
-        del enc, outputs, logits
+        shard_data["input_ids"].append(enc["input_ids"].cpu().squeeze(0))
+        shard_data["logit_values"].append(topk_vals.cpu().squeeze(0).half())   # [S, k] fp16
+        shard_data["logit_indices"].append(topk_idx.cpu().squeeze(0).int())    # [S, k] int32
+
+        del enc, outputs, full_logits, topk_vals, topk_idx
         torch.cuda.empty_cache()
 
-        # Save shard when full or every 100 samples to cap RAM
-        effective_shard = min(shard_size, 100) if max_samples and max_samples < shard_size else shard_size
-        if len(shard_data["input_ids"]) >= effective_shard:
-            shard_path = output_dir / f"shard_{shard_idx:04d}.pt"
+        if len(shard_data["input_ids"]) >= shard_size:
+            _save_sparse_shard(output_dir, shard_idx, shard_data, index_entries)
 
-            # Pad to max_length in this batch for uniform tensor sizes
-            batch_max = max(x.size(0) for x in shard_data["input_ids"])
-            padded_ids = torch.zeros(len(shard_data["input_ids"]), batch_max, dtype=torch.long)
-            padded_logits = torch.zeros(len(shard_data["logits"]), batch_max, shard_data["logits"][0].size(-1), dtype=torch.float16)
-            for j, (ids, lg) in enumerate(zip(shard_data["input_ids"], shard_data["logits"])):
-                padded_ids[j, :ids.size(0)] = ids
-                padded_logits[j, :lg.size(0)] = lg
-
-            torch.save({
-                "input_ids": padded_ids,
-                "logits": padded_logits,
-            }, shard_path)
-
-            for j in range(len(shard_data["input_ids"])):
-                index_entries.append({
-                    "shard": shard_idx,
-                    "offset": j,
-                    "length": shard_data["input_ids"][j].size(0),
-                })
-
-            shard_data = {"input_ids": [], "logits": []}
+            shard_data = {"input_ids": [], "logit_values": [], "logit_indices": []}
             shard_idx += 1
             gc.collect()
 
@@ -285,46 +256,63 @@ def cache_teacher_logits(
 
     # Save final partial shard
     if shard_data["input_ids"]:
-        shard_path = output_dir / f"shard_{shard_idx:04d}.pt"
-
-        batch_max = max(x.size(0) for x in shard_data["input_ids"])
-        padded_ids = torch.zeros(len(shard_data["input_ids"]), batch_max, dtype=torch.long)
-        padded_logits = torch.zeros(len(shard_data["logits"]), batch_max, shard_data["logits"][0].size(-1), dtype=torch.float16)
-        for j, (ids, lg) in enumerate(zip(shard_data["input_ids"], shard_data["logits"])):
-            padded_ids[j, :ids.size(0)] = ids
-            padded_logits[j, :lg.size(0)] = lg
-
-        torch.save({
-            "input_ids": padded_ids,
-            "logits": padded_logits,
-        }, shard_path)
-
-        for j in range(len(shard_data["input_ids"])):
-            index_entries.append({
-                "shard": shard_idx,
-                "offset": j,
-                "length": shard_data["input_ids"][j].size(0),
-            })
+        _save_sparse_shard(output_dir, shard_idx, shard_data, index_entries)
 
     # Save index
     with open(output_dir / "index.jsonl", "w") as f:
         f.writelines(json.dumps(entry) + "\n" for entry in index_entries)
 
-    # Save metadata
     meta = {
         "model_id": model_id,
         "dataset": f"{dataset_name}:{dataset_config}",
         "split": split,
         "max_length": max_length,
         "top_k": top_k,
+        "format": "sparse_topk",
         "total_samples": len(index_entries),
         "total_shards": shard_idx + 1,
     }
     with open(output_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"Cached {len(index_entries)} samples to {output_dir}")
+    print(f"Cached {len(index_entries)} samples (sparse) to {output_dir}")
     return output_dir
+
+
+def _save_sparse_shard(
+    output_dir: Path,
+    shard_idx: int,
+    shard_data: dict[str, list[torch.Tensor]],
+    index_entries: list[dict[str, Any]],
+) -> None:
+    """Pad and save a sparse shard."""
+    n = len(shard_data["input_ids"])
+    seq_max = max(x.size(0) for x in shard_data["input_ids"])
+    k = shard_data["logit_values"][0].size(-1)
+
+    padded_ids = torch.zeros(n, seq_max, dtype=torch.long)
+    padded_vals = torch.full((n, seq_max, k), float("-inf"), dtype=torch.float16)
+    padded_idx = torch.zeros(n, seq_max, k, dtype=torch.int32)
+
+    for j in range(n):
+        s = shard_data["input_ids"][j].size(0)
+        padded_ids[j, :s] = shard_data["input_ids"][j]
+        padded_vals[j, :s] = shard_data["logit_values"][j]
+        padded_idx[j, :s] = shard_data["logit_indices"][j]
+
+    shard_path = output_dir / f"shard_{shard_idx:04d}.pt"
+    torch.save({
+        "input_ids": padded_ids,
+        "logit_values": padded_vals,
+        "logit_indices": padded_idx,
+    }, shard_path)
+
+    for j in range(n):
+        index_entries.append({
+            "shard": shard_idx,
+            "offset": j,
+            "length": int(shard_data["input_ids"][j].size(0)),
+        })
 
 
 def train_student(
@@ -382,14 +370,12 @@ def train_student(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load student using the fallback-aware loader
     tokenizer = AutoTokenizer.from_pretrained(student_id, trust_remote_code=True)
     model = load_causal_lm(student_id, dtype=torch.float16, device_map=device,
                            trust_remote_code=True)
     student_vocab_size = model.config.vocab_size
 
     # Build vocab projection if teacher and student have different vocabs
-    vocab_proj = None
     meta_path = cache_dir / "meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     if meta.get("projected"):
@@ -400,10 +386,11 @@ def train_student(
             print(f"Building vocab projection: teacher {teacher_tok.vocab_size} → student {student_vocab_size}")
             vocab_proj = build_vocab_projection(teacher_model_id, student_id, device="cpu")
             torch.save(vocab_proj, cache_dir / "vocab_proj.pt")
-            # Pre-project all shards
             preproject_shards(cache_dir, vocab_proj, student_vocab_size)
 
-    # Load dataset
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
+
     dataset = CachedLogitsDataset(cache_dir, max_length=max_length,
                                   student_vocab_size=student_vocab_size)
     dataloader = DataLoader(
@@ -414,7 +401,6 @@ def train_student(
         pin_memory=True,
     )
 
-    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
@@ -423,7 +409,6 @@ def train_student(
         eps=1e-8,
     )
 
-    # Scheduler
     total_steps = len(dataloader) * epochs // gradient_accumulation_steps
     warmup_steps = int(total_steps * warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(
@@ -432,7 +417,6 @@ def train_student(
         num_training_steps=total_steps,
     )
 
-    # W&B
     if wandb:
         import wandb
         wandb.init(project=wandb_project, name=f"distill-{student_id.split('/')[-1]}",
@@ -440,7 +424,6 @@ def train_student(
                            "temperature": temperature, "alpha": alpha,
                            "lr": learning_rate, "epochs": epochs})
 
-    # Training loop
     model.train()
     global_step = 0
     running_loss = 0.0
@@ -448,7 +431,14 @@ def train_student(
     for epoch in range(epochs):
         for batch_idx, batch in enumerate(dataloader):
             input_ids = batch["input_ids"].to(device)
-            teacher_logits = batch["logits"].to(device)
+            logit_values = batch["logit_values"].to(device)     # [B, S, k] fp16
+            logit_indices = batch["logit_indices"].to(device)   # [B, S, k] int32
+
+            # Reconstruct teacher logits from sparse format
+            B, S, k = logit_values.shape
+            teacher_logits = torch.full((B, S, student_vocab_size), float("-inf"),
+                                        dtype=torch.float32, device=device)
+            teacher_logits.scatter_add_(-1, logit_indices.long(), logit_values.float())
 
             # Forward pass
             outputs = model(input_ids=input_ids)
@@ -512,11 +502,9 @@ def train_student(
 
         print(f"Epoch {epoch + 1}/{epochs} completed")
 
-    # Save final model
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
 
-    # Save training config
     config = {
         "student_id": student_id,
         "teacher_model_id": teacher_model_id,
