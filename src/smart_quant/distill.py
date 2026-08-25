@@ -1,11 +1,15 @@
 """Knowledge distillation: cache teacher logits, train student against cached targets.
 
-Phase 1: Cache teacher logits (offline KD) — sparse top-k format
-Phase 2: Train student against cached logits (with optional vocab projection)
+Phase 1: Cache teacher logits (offline KD) — sparse top-k format in TEACHER vocab
+Phase 2: Train student against cached logits — project STUDENT logits UP to teacher vocab
 Phase 3: Evaluate distilled student
 
 Sparse format: each shard stores top-k (values, indices) per position instead of
-the full vocab distribution. Reduces shard size from ~15GB to ~10MB (1500× smaller).
+the full vocab distribution. Reduces shard size from ~15GB to ~150MB.
+
+Cross-vocab strategy: teacher logits stay in teacher vocab. During training,
+student logits are projected UP to teacher vocab via a learned projection matrix.
+KL divergence computed entirely in teacher vocab space — no -inf positions.
 """
 from __future__ import annotations
 
@@ -15,8 +19,51 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+
+class VocabProjector(nn.Module):
+    """Projects student logits to teacher vocab space via a learned linear layer."""
+
+    def __init__(self, student_vocab: int, teacher_vocab: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(student_vocab, teacher_vocab, bias=False)
+
+    def forward(self, student_logits: torch.Tensor) -> torch.Tensor:
+        """Project [B, S, student_vocab] → [B, S, teacher_vocab]."""
+        return self.linear(student_logits.float())
+
+
+def build_reverse_vocab_projection(
+    teacher_model_id: str,
+    student_model_id: str,
+) -> torch.Tensor:
+    """Build a student→teacher vocab mapping as a 2-D projection matrix.
+
+    For each student token, find the corresponding teacher token ID.
+    Returns:
+        Long tensor of shape [student_vocab] where entry[i] = teacher token ID.
+    """
+    from transformers import AutoTokenizer
+
+    teacher_tok = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
+    student_tok = AutoTokenizer.from_pretrained(student_model_id, trust_remote_code=True)
+
+    student_vocab = student_tok.vocab_size
+    teacher_vocab = teacher_tok.vocab_size
+    mapping = torch.zeros(student_vocab, dtype=torch.long)
+    mapped = 0
+    for s_id in range(student_vocab):
+        token_str = student_tok.decode([s_id])
+        t_ids = teacher_tok.encode(token_str, add_special_tokens=False)
+        if t_ids:
+            mapping[s_id] = t_ids[0]
+            mapped += 1
+
+    print(f"Reverse vocab projection: {mapped}/{student_vocab} student tokens mapped to teacher vocab")
+    return mapping
 
 
 def build_vocab_projection(
@@ -48,85 +95,29 @@ def build_vocab_projection(
     return mapping
 
 
-def preproject_shards(
-    cache_dir: Path,
-    vocab_proj: torch.Tensor,
-    student_vocab_size: int,
-    top_k: int = 100,
-) -> None:
-    """Pre-project all cached sparse shards from teacher vocab to student vocab.
-
-    Maps teacher token indices → student token indices in the sparse format.
-    Overwrites shards in-place and updates meta.json.
-    """
-    shard_files = sorted(cache_dir.glob("shard_*.pt"))
-    print(f"Pre-projecting {len(shard_files)} sparse shards: teacher → student vocab ({student_vocab_size})")
-
-    for shard_path in shard_files:
-        print(f"  Projecting {shard_path.name}...", end=" ", flush=True)
-        data = torch.load(shard_path, weights_only=True)
-        input_ids = data["input_ids"]
-        logit_values = data["logit_values"]    # [N, S, k] fp16
-        logit_indices = data["logit_indices"]  # [N, S, k] int32
-
-        # Remap input_ids
-        safe_ids = input_ids.clamp(0, vocab_proj.size(0) - 1)
-        new_ids = vocab_proj[safe_ids]
-
-        # Remap logit indices: teacher vocab → student vocab
-        safe_idx = logit_indices.clamp(0, vocab_proj.size(0) - 1)
-        student_indices = vocab_proj[safe_idx].to(torch.int32)
-
-        # Save projected shard
-        torch.save({
-            "input_ids": new_ids,
-            "logit_values": logit_values,
-            "logit_indices": student_indices,
-        }, shard_path)
-        print(f"done (logits: [{logit_values.shape[0]}, {logit_values.shape[1]}, {top_k}] → student vocab {student_vocab_size})")
-        del data, input_ids, logit_values, logit_indices
-        gc.collect()
-
-    # Update meta.json
-    meta_path = cache_dir / "meta.json"
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text())
-        meta["student_vocab_size"] = student_vocab_size
-        meta["projected"] = True
-        meta_path.write_text(json.dumps(meta, indent=2))
-
-    print("Pre-projection complete")
-
-
 class CachedLogitsDataset(Dataset):
-    """Dataset of cached teacher logits (sparse top-k format) for offline distillation.
+    """Dataset of cached teacher logits (sparse top-k format) in teacher vocab space.
 
     Each shard stores:
         input_ids:  [N, S] long
         logit_values:  [N, S, k] fp16  (top-k values)
-        logit_indices: [N, S, k] int32 (top-k positions in vocab)
+        logit_indices: [N, S, k] int32 (top-k positions in TEACHER vocab)
     """
 
     def __init__(
         self,
         cache_dir: Path,
         max_length: int = 2048,
-        top_k: int = 100,
-        student_vocab_size: int | None = None,
     ):
         self.cache_dir = Path(cache_dir)
         self.max_length = max_length
-        self.top_k = top_k
-        self.student_vocab_size = student_vocab_size
 
-        # Load index file
         index_path = self.cache_dir / "index.jsonl"
         self.index: list[dict[str, Any]] = []
         with open(index_path) as f:
             for line in f:
                 self.index.append(json.loads(line))
 
-        # Cache shard data to avoid re-loading from disk for every sample
         self._shard_cache: dict[int, dict[str, torch.Tensor]] = {}
 
     def __len__(self) -> int:
@@ -150,7 +141,6 @@ class CachedLogitsDataset(Dataset):
         logit_values = data["logit_values"][offset, :length, :]    # [length, k]
         logit_indices = data["logit_indices"][offset, :length, :]  # [length, k]
 
-        # Pad to max_length
         pad_len = self.max_length - input_ids.size(0)
         if pad_len > 0:
             input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=0)
@@ -176,10 +166,7 @@ def cache_teacher_logits(
     max_samples: int | None = None,
     device: str = "cuda",
 ) -> Path:
-    """Cache teacher model's top-K logits in sparse format.
-
-    Each shard stores only the top-k (value, index) pairs per token position
-    instead of the full vocab distribution. Reduces storage ~1500×.
+    """Cache teacher model's top-K logits in sparse format (teacher vocab space).
 
     Args:
         model_id: HuggingFace model ID or local path
@@ -233,7 +220,7 @@ def cache_teacher_logits(
             outputs = model(**enc)
             full_logits = outputs.logits.float()  # [1, seq_len, vocab]
 
-        # Extract top-k sparse representation
+        # Extract top-k sparse representation (in teacher vocab space)
         k = min(top_k, full_logits.size(-1))
         topk_vals, topk_idx = torch.topk(full_logits, k, dim=-1)  # [1, S, k]
 
@@ -246,7 +233,6 @@ def cache_teacher_logits(
 
         if len(shard_data["input_ids"]) >= shard_size:
             _save_sparse_shard(output_dir, shard_idx, shard_data, index_entries)
-
             shard_data = {"input_ids": [], "logit_values": [], "logit_indices": []}
             shard_idx += 1
             gc.collect()
@@ -254,11 +240,9 @@ def cache_teacher_logits(
         if (i + 1) % 100 == 0:
             print(f"  Processed {i + 1} samples, {shard_idx} shards saved")
 
-    # Save final partial shard
     if shard_data["input_ids"]:
         _save_sparse_shard(output_dir, shard_idx, shard_data, index_entries)
 
-    # Save index
     with open(output_dir / "index.jsonl", "w") as f:
         f.writelines(json.dumps(entry) + "\n" for entry in index_entries)
 
@@ -337,6 +321,9 @@ def train_student(
 ) -> Path:
     """Train student model against cached teacher logits.
 
+    Cross-vocab: student logits are projected UP to teacher vocab space via
+    a learned VocabProjector. KL divergence computed in teacher vocab space.
+
     Args:
         student_id: HuggingFace model ID or local path for student
         cache_dir: Directory with cached teacher logits
@@ -375,24 +362,50 @@ def train_student(
                            trust_remote_code=True)
     student_vocab_size = model.config.vocab_size
 
-    # Build vocab projection if teacher and student have different vocabs
+    # Build vocab projector: student → teacher vocab
     meta_path = cache_dir / "meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    if meta.get("projected"):
-        print(f"Shards already pre-projected to student vocab {meta.get('student_vocab_size')}")
-    elif teacher_model_id:
-        teacher_tok = AutoTokenizer.from_pretrained(teacher_model_id, trust_remote_code=True)
-        if teacher_tok.vocab_size != tokenizer.vocab_size:
-            print(f"Building vocab projection: teacher {teacher_tok.vocab_size} → student {student_vocab_size}")
-            vocab_proj = build_vocab_projection(teacher_model_id, student_id, device="cpu")
-            torch.save(vocab_proj, cache_dir / "vocab_proj.pt")
-            preproject_shards(cache_dir, vocab_proj, student_vocab_size)
+
+    teacher_tok = AutoTokenizer.from_pretrained(teacher_model_id or meta.get("model_id", student_id),
+                                                trust_remote_code=True)
+    teacher_vocab_size = teacher_tok.vocab_size
+
+    # Determine teacher vocab size from cached logits (look at actual data)
+    shard_path = cache_dir / "shard_0000.pt"
+    if shard_path.exists():
+        sample_shard = torch.load(shard_path, weights_only=True)
+        teacher_vocab_size = sample_shard["logit_indices"].max().item() + 1
+        del sample_shard
+        print(f"Teacher vocab size from cached logits: {teacher_vocab_size}")
+
+    projector_path = cache_dir / "vocab_projector.pt"
+    if projector_path.exists():
+        print(f"Loading cached vocab projector: {projector_path}")
+        vocab_projector = VocabProjector(student_vocab_size, teacher_vocab_size)
+        vocab_projector.load_state_dict(torch.load(projector_path, weights_only=True))
+    else:
+        print(f"Building vocab projector: student {student_vocab_size} → teacher {teacher_vocab_size}")
+        reverse_mapping = build_reverse_vocab_projection(teacher_model_id or meta.get("model_id", student_id),
+                                                         student_id)
+        # Initialize projection as sparse one-hot: [student_vocab, teacher_vocab]
+        proj = torch.zeros(student_vocab_size, teacher_vocab_size)
+        valid = reverse_mapping > 0
+        proj[valid, reverse_mapping[valid]] = 1.0
+        # Also map token 0 to token 0
+        proj[0, 0] = 1.0
+
+        vocab_projector = VocabProjector(student_vocab_size, teacher_vocab_size)
+        with torch.no_grad():
+            vocab_projector.linear.weight.copy_(proj)
+        torch.save(vocab_projector.state_dict(), projector_path)
+        print(f"Sparse projector initialized ({valid.sum()}/{student_vocab_size} valid mappings)")
+
+    vocab_projector = vocab_projector.to(device)
 
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
 
-    dataset = CachedLogitsDataset(cache_dir, max_length=max_length,
-                                  student_vocab_size=student_vocab_size)
+    dataset = CachedLogitsDataset(cache_dir, max_length=max_length)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -401,8 +414,9 @@ def train_student(
         pin_memory=True,
     )
 
+    # Combine student model + projector parameters
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        list(model.parameters()) + list(vocab_projector.parameters()),
         lr=learning_rate,
         weight_decay=weight_decay,
         betas=(0.9, 0.999),
@@ -425,6 +439,7 @@ def train_student(
                            "lr": learning_rate, "epochs": epochs})
 
     model.train()
+    vocab_projector.train()
     global_step = 0
     running_loss = 0.0
 
@@ -434,24 +449,31 @@ def train_student(
             logit_values = batch["logit_values"].to(device)     # [B, S, k] fp16
             logit_indices = batch["logit_indices"].to(device)   # [B, S, k] int32
 
-            # Reconstruct teacher logits from sparse format
+            # Reconstruct teacher logits in TEACHER vocab space
             B, S, k = logit_values.shape
-            teacher_logits = torch.full((B, S, student_vocab_size), float("-inf"),
+            teacher_logits = torch.full((B, S, teacher_vocab_size), float("-inf"),
                                         dtype=torch.float32, device=device)
-            # Use scatter_ (last-write-wins) not scatter_add_ (sums duplicate mappings)
             teacher_logits.scatter_(-1, logit_indices.long(), logit_values.float())
 
-            # Forward pass
+            # Student forward pass → logits in student vocab
             outputs = model(input_ids=input_ids)
-            student_logits = outputs.logits
+            student_logits = outputs.logits  # [B, S, student_vocab]
+
+            # Project student logits to teacher vocab space
+            projected_logits = vocab_projector(student_logits)  # [B, S, teacher_vocab]
 
             # Distillation loss (KL divergence with temperature)
+            # Both distributions are now in teacher vocab space
             T = temperature
+
+            student_log_probs = F.log_softmax(projected_logits / T, dim=-1)
+            teacher_log_probs = torch.log(F.softmax(teacher_logits / T, dim=-1) + 1e-8)
+
             loss_kl = F.kl_div(
-                F.log_softmax(student_logits / T, dim=-1),
-                F.softmax(teacher_logits / T, dim=-1),
+                student_log_probs,
+                teacher_log_probs,
                 reduction="batchmean",
-                log_target=False,
+                log_target=True,
             ) * (T ** 2)
 
             # Hard label loss (cross-entropy on input_ids shifted by 1)
@@ -471,7 +493,8 @@ def train_student(
             loss.backward()
 
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.parameters()) + list(vocab_projector.parameters()), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()

@@ -10,26 +10,26 @@ import torch
 
 @pytest.fixture
 def mock_cache_dir(tmp_path: Path) -> Path:
-    """Create a mock cached logits directory for testing."""
+    """Create a mock cached logits directory in sparse top-k format."""
     cache_dir = tmp_path / "teacher_logits"
     cache_dir.mkdir()
 
-    # Create a small shard
     batch_size = 4
     seq_len = 32
     vocab_size = 1000
     top_k = 10
 
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
-    logits = torch.randn(batch_size, seq_len, vocab_size)
+    logit_values = torch.randn(batch_size, seq_len, top_k)
+    logit_indices = torch.randint(0, vocab_size, (batch_size, seq_len, top_k))
 
     shard_path = cache_dir / "shard_0000.pt"
     torch.save({
         "input_ids": input_ids,
-        "logits": logits,
+        "logit_values": logit_values.half(),
+        "logit_indices": logit_indices.int(),
     }, shard_path)
 
-    # Create index
     index_entries = []
     for i in range(batch_size):
         index_entries.append({
@@ -41,13 +41,13 @@ def mock_cache_dir(tmp_path: Path) -> Path:
     with open(cache_dir / "index.jsonl", "w") as f:
         f.writelines(json.dumps(entry) + "\n" for entry in index_entries)
 
-    # Create metadata
     meta = {
         "model_id": "test-model",
         "dataset": "test:dataset",
         "split": "train",
         "max_length": 2048,
         "top_k": top_k,
+        "format": "sparse_topk",
         "total_samples": batch_size,
         "total_shards": 1,
     }
@@ -58,44 +58,25 @@ def mock_cache_dir(tmp_path: Path) -> Path:
 
 
 def test_cached_logits_dataset_loads(mock_cache_dir: Path) -> None:
-    """CachedLogitsDataset loads shards correctly."""
+    """CachedLogitsDataset loads sparse shards correctly."""
     from smart_quant.distill import CachedLogitsDataset
 
-    dataset = CachedLogitsDataset(mock_cache_dir, top_k=10)
+    dataset = CachedLogitsDataset(mock_cache_dir, max_length=32)
 
     assert len(dataset) == 4
     sample = dataset[0]
 
     assert "input_ids" in sample
-    assert "logits" in sample
-    # Shape is [batch, seq_len] for input_ids and [batch, seq_len, top_k] for logits
-    # But since we're loading per-sample, it's just [seq_len] and [seq_len, top_k]
-    assert sample["input_ids"].dim() == 1  # seq_len
-    assert sample["logits"].dim() == 2  # [seq_len, top_k]
+    assert "logit_values" in sample
+    assert "logit_indices" in sample
+    assert sample["input_ids"].dim() == 1  # [seq_len]
+    assert sample["logit_values"].dim() == 2  # [seq_len, k]
+    assert sample["logit_indices"].dim() == 2  # [seq_len, k]
 
 
-def test_cached_logits_dataset_top_k(mock_cache_dir: Path) -> None:
-    """CachedLogitsDataset sparsifies to top-k logits."""
-    from smart_quant.distill import CachedLogitsDataset
-
-    dataset = CachedLogitsDataset(mock_cache_dir, top_k=5)
-    sample = dataset[0]
-
-    # Should have top-k non-inf values per token
-    # (masked with -inf rather than physically removed)
-    non_inf_per_token = (sample["logits"] != float("-inf")).sum(dim=-1)
-    assert (non_inf_per_token == 5).all()
-
-    # The shape stays [seq_len, vocab_size] but only top-k are non-inf
-    assert sample["logits"].shape == (32, 1000)
-
-
-def test_cache_teacher_logits_creates_structure(tmp_path: Path) -> None:
-    """cache_teacher_logits creates expected directory structure."""
+def test_cache_teacher_logits_importable() -> None:
+    """cache_teacher_logits is importable and callable."""
     from smart_quant.distill import cache_teacher_logits
-
-    # This would fail without a real model, but we can test the function signature
-    # and that it imports correctly
     assert callable(cache_teacher_logits)
 
 
@@ -136,3 +117,25 @@ def test_training_config_save(tmp_path: Path) -> None:
 
     assert loaded["student_id"] == "test-student"
     assert loaded["temperature"] == 4.0
+
+
+def test_sparse_shard_reconstruction(mock_cache_dir: Path) -> None:
+    """Sparse logits can be reconstructed into dense form for KL computation."""
+    from smart_quant.distill import CachedLogitsDataset
+
+    dataset = CachedLogitsDataset(mock_cache_dir, max_length=32)
+    sample = dataset[0]
+
+    seq_len = 32
+    vocab_size = 1000
+    logit_values = sample["logit_values"]    # [seq_len, k]
+    logit_indices = sample["logit_indices"]  # [seq_len, k]
+
+    # Reconstruct dense
+    dense = torch.full((seq_len, vocab_size), float("-inf"))
+    dense.scatter_(-1, logit_indices.long(), logit_values.float())
+
+    # Check: positions with top-k values should be non-inf
+    non_inf = (dense != float("-inf")).sum(dim=-1)
+    # May be less than k due to duplicate indices, but should be > 0
+    assert (non_inf > 0).all()
